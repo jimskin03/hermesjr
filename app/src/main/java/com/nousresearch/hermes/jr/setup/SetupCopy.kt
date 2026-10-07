@@ -1,13 +1,23 @@
 package com.nousresearch.hermes.jr.setup
 
 object SetupCopy {
-    const val LINUX = """mkdir -p ~/.config/systemd/user
+    fun script(segment: String, username: String, password: String, secret: String): String = when (segment) {
+        "macOS" -> mac(username, password, secret)
+        "Logout only" -> TMUX
+        else -> linux(username, password, secret)
+    }
+
+    fun linux(username: String, password: String, secret: String): String {
+        val user = oneLine(username)
+        val pass = oneLine(password)
+        val key = oneLine(secret)
+        return """mkdir -p ~/.config/systemd/user
 install -m 600 /dev/null ~/.hermes/.env 2>/dev/null || true
-cat >> ~/.hermes/.env <<'EOF'
-HERMES_DASHBOARD_BASIC_AUTH_USERNAME=admin
-HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=choose-a-strong-password
-HERMES_DASHBOARD_BASIC_AUTH_SECRET=REPLACE_WITH_openssl_rand_-base64_32
-EOF
+cat >> ~/.hermes/.env <<'HERMES_JR_ENV'
+HERMES_DASHBOARD_BASIC_AUTH_USERNAME=$user
+HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=$pass
+HERMES_DASHBOARD_BASIC_AUTH_SECRET=$key
+HERMES_JR_ENV
 chmod 600 ~/.hermes/.env
 
 cat > ~/.config/systemd/user/hermes-serve.service <<'EOF'
@@ -30,12 +40,17 @@ EOF
 systemctl --user daemon-reload
 systemctl --user enable --now hermes-serve.service
 loginctl enable-linger "${'$'}USER""""
+    }
 
     const val LINUX_NOTE = """Replace --host 0.0.0.0 with the computer's Tailscale address when it is on a tailnet. That address may be IPv4 CGNAT (100.x) or Tailscale IPv6 (fd7a:115c:a1e0::/48). A v6 address in the phone URL is bracketed: http://[fd7a:115c:a1e0::1234]:9119.
 
 systemd treats the SIGTERM from hermes serve --stop as a clean stop, so Restart=on-failure does not bring it back. A SIGKILL after the 10 second grace can. Park the unit with systemctl --user stop hermes-serve.service."""
 
-    const val MAC = """<?xml version="1.0" encoding="UTF-8"?>
+    fun mac(username: String, password: String, secret: String): String {
+        val user = xml(username)
+        val pass = xml(password)
+        val key = xml(secret)
+        return """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -49,14 +64,15 @@ systemd treats the SIGTERM from hermes serve --stop as a clean stop, so Restart=
   </array>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>HERMES_DASHBOARD_BASIC_AUTH_USERNAME</key><string>admin</string>
-    <key>HERMES_DASHBOARD_BASIC_AUTH_PASSWORD</key><string>choose-a-strong-password</string>
-    <key>HERMES_DASHBOARD_BASIC_AUTH_SECRET</key><string>REPLACE_WITH_openssl_rand_-base64_32</string>
+    <key>HERMES_DASHBOARD_BASIC_AUTH_USERNAME</key><string>$user</string>
+    <key>HERMES_DASHBOARD_BASIC_AUTH_PASSWORD</key><string>$pass</string>
+    <key>HERMES_DASHBOARD_BASIC_AUTH_SECRET</key><string>$key</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
 </dict>
 </plist>"""
+    }
 
     const val MAC_NOTE = """Save that as ~/Library/LaunchAgents/ai.hermes.serve.plist, then launchctl bootstrap gui/${'$'}UID ~/Library/LaunchAgents/ai.hermes.serve.plist. KeepAlive starts it again after hermes serve --stop. Park it with launchctl bootout gui/${'$'}UID/ai.hermes.serve."""
 
@@ -65,6 +81,13 @@ systemd treats the SIGTERM from hermes serve --stop as a clean stop, so Restart=
     const val TMUX_NOTE = "This survives closing the terminal. It does not survive a reboot."
 
     const val WINDOWS = "On Windows, run hermes serve --host 0.0.0.0 --port 9119 at logon from Task Scheduler or the process manager that already supervises the machine. There is no --bg flag."
+
+    private fun oneLine(value: String) = value.replace("\r", "").replace("\n", "").trim()
+
+    private fun xml(value: String) = oneLine(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
 
     const val LOST_PHONE = """Signing out on this phone only deletes the tokens stored here. There is no remote sign-out for one Hermes Jr. device.
 

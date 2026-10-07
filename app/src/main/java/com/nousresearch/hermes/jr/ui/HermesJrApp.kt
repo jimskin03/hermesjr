@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBars
@@ -166,7 +167,6 @@ fun HermesJrApp(model: HermesModel = viewModel()) {
 @Composable
 private fun ConnectScreen(state: UiState, model: HermesModel) {
     var url by rememberSaveable { mutableStateOf(state.baseUrl) }
-    var segment by rememberSaveable { mutableStateOf("Linux") }
     val context = LocalContext.current
     LaunchedEffect(state.baseUrl) { if (url.isBlank()) url = state.baseUrl }
     Column(
@@ -199,28 +199,120 @@ private fun ConnectScreen(state: UiState, model: HermesModel) {
         }
         if (state.notice.isNotBlank()) Text(state.notice, color = Danger)
         Text("Keep the computer's gateway up", color = Ink, fontWeight = FontWeight.SemiBold)
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            listOf("Linux", "macOS", "Logout only").forEach { label ->
-                TextButton(onClick = { segment = label }) {
-                    Text(label, color = if (segment == label) Accent else Muted)
-                }
+        GatewaySetup()
+    }
+}
+
+@Composable
+private fun GatewaySetup() {
+    var segment by rememberSaveable { mutableStateOf("Linux") }
+    var username by rememberSaveable { mutableStateOf("") }
+    var password by rememberSaveable { mutableStateOf("") }
+    var secret by rememberSaveable { mutableStateOf("") }
+    var editing by rememberSaveable { mutableStateOf(false) }
+    var draft by rememberSaveable { mutableStateOf("") }
+    var saved by rememberSaveable { mutableStateOf("") }
+    var custom by rememberSaveable { mutableStateOf(false) }
+    val context = LocalContext.current
+    val needsSignIn = segment != "Logout only"
+    val ready = !needsSignIn || (username.isNotBlank() && password.isNotBlank() && secret.isNotBlank())
+    val generated = SetupCopy.script(segment, username, password, secret)
+    val current = if (custom && saved.isNotBlank()) saved else generated
+    LaunchedEffect(segment, username, password, secret) {
+        custom = false
+        if (editing) draft = generated
+    }
+    val note = when (segment) {
+        "macOS" -> SetupCopy.MAC_NOTE
+        "Logout only" -> SetupCopy.TMUX_NOTE
+        else -> SetupCopy.LINUX_NOTE
+    }
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        listOf("Linux", "macOS", "Logout only").forEach { label ->
+            TextButton(onClick = {
+                segment = label
+                editing = false
+            }) {
+                Text(label, color = if (segment == label) Accent else Muted)
             }
         }
-        val block = when (segment) {
-            "macOS" -> SetupCopy.MAC
-            "Logout only" -> SetupCopy.TMUX
-            else -> SetupCopy.LINUX
-        }
-        val note = when (segment) {
-            "macOS" -> SetupCopy.MAC_NOTE
-            "Logout only" -> SetupCopy.TMUX_NOTE
-            else -> SetupCopy.LINUX_NOTE
-        }
-        Text(block, color = Ink, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
-        TextButton(onClick = { copy(context, block) }) { Text("Copy", color = Accent) }
-        Text(note, color = Muted, fontSize = 13.sp)
-        Text(SetupCopy.WINDOWS, color = Muted, fontSize = 13.sp)
     }
+    if (needsSignIn) {
+        Text("Paste the sign-in values. On the computer, create the secret with openssl rand -base64 32.", color = Muted, fontSize = 13.sp)
+        OutlinedTextField(
+            username,
+            { username = it },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("Username") },
+            singleLine = true,
+            colors = fieldColors(),
+        )
+        OutlinedTextField(
+            password,
+            { password = it },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("Password") },
+            singleLine = true,
+            visualTransformation = PasswordVisualTransformation(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+            colors = fieldColors(),
+        )
+        OutlinedTextField(
+            secret,
+            { secret = it },
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("Secret") },
+            singleLine = true,
+            visualTransformation = PasswordVisualTransformation(),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+            colors = fieldColors(),
+        )
+    }
+    if (!ready) {
+        Text("Username, password, and secret are all required before the setup can be copied.", color = Muted, fontSize = 13.sp)
+    }
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        TextButton(onClick = { copy(context, current) }, enabled = ready && !editing) {
+            Text("Copy", color = if (ready && !editing) Accent else Muted)
+        }
+        if (!editing) {
+            TextButton(
+                onClick = {
+                    draft = current
+                    editing = true
+                },
+                enabled = ready,
+            ) { Text("Edit", color = if (ready) Accent else Muted) }
+        }
+    }
+    if (editing) {
+        OutlinedTextField(
+            draft,
+            { draft = it },
+            modifier = Modifier.fillMaxWidth().heightIn(min = 180.dp, max = 360.dp),
+            label = { Text("Setup") },
+            textStyle = androidx.compose.ui.text.TextStyle(
+                fontFamily = FontFamily.Monospace,
+                fontSize = 12.sp,
+                color = Ink,
+            ),
+            colors = fieldColors(),
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = {
+                    saved = draft
+                    custom = true
+                    copy(context, draft)
+                    editing = false
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = Accent, contentColor = Field),
+            ) { Text("Save & copy") }
+            TextButton(onClick = { editing = false }) { Text("Close", color = Muted) }
+        }
+    }
+    Text(note, color = Muted, fontSize = 13.sp)
+    Text(SetupCopy.WINDOWS, color = Muted, fontSize = 13.sp)
 }
 
 @Composable
@@ -647,9 +739,7 @@ private fun ScreenPane(state: UiState, model: HermesModel) {
 
 @Composable
 private fun MorePane(state: UiState, model: HermesModel) {
-    var segment by rememberSaveable { mutableStateOf("Linux") }
     var url by rememberSaveable { mutableStateOf(state.baseUrl) }
-    val context = LocalContext.current
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp).imePadding(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Text(state.baseUrl, color = Ink)
         OutlinedTextField(url, { url = it }, label = { Text("Computer") }, modifier = Modifier.fillMaxWidth(), colors = fieldColors())
@@ -657,19 +747,8 @@ private fun MorePane(state: UiState, model: HermesModel) {
             Text("Use this computer")
         }
         TextButton(onClick = model::signOut) { Text("Sign out", color = Danger) }
-        Row {
-            listOf("Linux", "macOS", "Logout only").forEach { label ->
-                TextButton(onClick = { segment = label }) { Text(label, color = if (segment == label) Accent else Muted) }
-            }
-        }
-        val block = when (segment) {
-            "macOS" -> SetupCopy.MAC
-            "Logout only" -> SetupCopy.TMUX
-            else -> SetupCopy.LINUX
-        }
-        Text(block, color = Ink, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
-        TextButton(onClick = { copy(context, block) }) { Text("Copy", color = Accent) }
-        Text(SetupCopy.WINDOWS, color = Muted, fontSize = 13.sp)
+        Text("Keep the computer's gateway up", color = Ink, fontWeight = FontWeight.SemiBold)
+        GatewaySetup()
         Text("Lost phone", color = Ink, fontWeight = FontWeight.SemiBold)
         Text(SetupCopy.LOST_PHONE, color = Muted, fontSize = 13.sp)
     }

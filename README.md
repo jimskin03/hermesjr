@@ -29,7 +29,7 @@ hermes serve --host 0.0.0.0 --port 9119
 
 There is no `--bg` flag. A process started in a terminal dies when you log out. To survive reboot, supervise it.
 
-**Linux.** A systemd user unit. The app's Connect screen has the full unit to copy. The shape is:
+**Linux.** A systemd user unit. On the phone, paste a username, password, and secret, then tap Copy. Edit opens the filled-in script if you need to change it, then Save & copy. The secret is the output of `openssl rand -base64 32` on the computer. The unit looks like this:
 
 ```ini
 [Service]
