@@ -26,7 +26,12 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
@@ -51,6 +56,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -434,14 +440,49 @@ private fun ChatPane(state: UiState, model: HermesModel) {
         if (uri != null) model.attach(uri)
     }
     Column(Modifier.fillMaxSize().imePadding()) {
-        Text(chat.profile, color = Ink, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
-        LazyColumn(Modifier.weight(1f).padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(chat.lines.size) { index ->
-                val line = chat.lines[index]
-                Text(line.text, color = if (line.role == "user") Accent else Ink)
-                if (line.role == "tool") Text(line.role, color = Muted, fontSize = 11.sp)
+        Row(Modifier.padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Avatar(chat.profile, 26)
+            Spacer(Modifier.width(8.dp))
+            Text(chat.profile, color = Ink, fontWeight = FontWeight.SemiBold)
+        }
+        val list = rememberLazyListState()
+        val shown = chat.lines.filter { it.text.isNotBlank() && it.role != "system" }
+        AutoScroll(list, shown.size, chat.draft.length + chat.reasoning.length / 200 + (if (chat.streaming) 1 else 0))
+        LazyColumn(
+            Modifier.weight(1f).padding(horizontal = 12.dp),
+            state = list,
+            contentPadding = PaddingValues(bottom = 8.dp),
+        ) {
+            items(shown.size) { index ->
+                val line = shown[index]
+                val prev = shown.getOrNull(index - 1)
+                when (line.role) {
+                    "user" -> MessageBubble("you", line.text, mine = true, showHeader = prev?.role != "user")
+                    "tool" -> ToolRow(line.text)
+                    else -> MessageBubble(
+                        chat.profile,
+                        line.text,
+                        mine = false,
+                        showHeader = prev == null || prev.role == "user",
+                    )
+                }
             }
-            if (chat.draft.isNotBlank()) item { Text(chat.draft, color = Ink) }
+            if (chat.draft.isNotBlank()) {
+                item(key = "draft") {
+                    MessageBubble(chat.profile, chat.draft, mine = false, showHeader = shown.lastOrNull()?.role.let { it == null || it == "user" })
+                }
+            } else if (chat.streaming) {
+                item(key = "typing") {
+                    TypingIndicator(
+                        when {
+                            chat.activity.isNotBlank() -> "Using ${chat.activity}"
+                            chat.reasoning.isNotBlank() -> "Thinking"
+                            else -> "${chat.profile} is working"
+                        },
+                        chat.profile,
+                    )
+                }
+            }
         }
         Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(
@@ -479,12 +520,49 @@ private fun RoomPane(state: UiState, model: HermesModel) {
             if (state.membersEditable) TextButton(onClick = { editing = true }) { Text("Members", color = Accent) }
             TextButton(onClick = { disband = true }) { Text("Disband", color = Danger) }
         }
-        LazyColumn(Modifier.weight(1f).padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(room.events.distinctBy { it.key.ifBlank { "s${it.seq}-${it.who}" } }, key = { it.key.ifBlank { "s${it.seq}-${it.who}" } }) { event ->
-                Text(event.who, color = Muted, fontSize = 12.sp)
-                Text(event.text, color = if (event.who == "you") Accent else Ink)
+        val list = rememberLazyListState()
+        val events = room.events.distinctBy { it.key.ifBlank { "s${it.seq}-${it.who}" } }
+        AutoScroll(list, events.size + room.pending.size + room.thinking.size, room.live.length)
+        LazyColumn(
+            Modifier.weight(1f).padding(horizontal = 12.dp),
+            state = list,
+            contentPadding = PaddingValues(bottom = 8.dp),
+        ) {
+            if (room.loaded && events.isEmpty()) {
+                item(key = "empty") { NoticeRow("No messages yet. Say hi — an empty @ addresses everyone.") }
             }
-            if (room.live.isNotBlank()) item { Text(room.live, color = Ink) }
+            items(events.size, key = { events[it].key.ifBlank { "s${events[it].seq}-${events[it].who}" } }) { index ->
+                val event = events[index]
+                val prev = events.getOrNull(index - 1)
+                // Group consecutive messages from one speaker within 5 minutes under one header.
+                val grouped = prev != null && prev.role == event.role && prev.who == event.who &&
+                    (event.at == 0L || prev.at == 0L || event.at - prev.at < 5 * 60_000)
+                when (event.role) {
+                    "notice" -> NoticeRow(event.text)
+                    "user" -> MessageBubble("you", event.text, mine = true, showHeader = !grouped, time = relativeTime(event.at), pending = event.sending)
+                    else -> MessageBubble(event.who, event.text, mine = false, showHeader = !grouped, time = relativeTime(event.at))
+                }
+            }
+            if (room.live.isNotBlank()) {
+                item(key = "live") {
+                    MessageBubble(room.liveWho.ifBlank { "bot" }, room.live, mine = false, showHeader = events.lastOrNull()?.who != room.liveWho)
+                }
+            }
+            val waiting = room.thinking.filter { it != room.liveWho || room.live.isBlank() }
+            if (waiting.isNotEmpty()) {
+                item(key = "thinking") {
+                    TypingIndicator(
+                        when (waiting.size) {
+                            1 -> "@${waiting[0]} is thinking"
+                            2 -> "@${waiting[0]} and @${waiting[1]} are thinking"
+                            else -> "${waiting.size} bots are thinking"
+                        },
+                        waiting.first(),
+                    )
+                }
+            } else if (room.working && room.live.isBlank()) {
+                item(key = "working") { TypingIndicator("Working") }
+            }
             items(room.pending.distinctBy { it.requestId.ifBlank { it.taskId } }, key = { it.requestId.ifBlank { it.taskId } }) { action ->
                 PendingRow(action, model)
             }
@@ -895,4 +973,27 @@ private fun copy(context: Context, text: String) {
     val clipboard = context.getSystemService(ClipboardManager::class.java)
     clipboard.setPrimaryClip(ClipData.newPlainText("hermes", text))
     Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
+}
+
+/**
+ * Keep the newest message in view: jump to the bottom when items are added, and follow a streaming
+ * reply only while the reader is already at the bottom (scrolling up to read stops the follow).
+ */
+@Composable
+private fun AutoScroll(list: LazyListState, count: Int, growth: Int) {
+    val atBottom by remember(list) {
+        derivedStateOf {
+            val info = list.layoutInfo
+            val last = info.visibleItemsInfo.lastOrNull()
+            last == null || last.index >= info.totalItemsCount - 2
+        }
+    }
+    LaunchedEffect(count) {
+        val total = list.layoutInfo.totalItemsCount
+        if (total > 0) list.scrollToItem(total - 1, Int.MAX_VALUE / 2)
+    }
+    LaunchedEffect(growth) {
+        val total = list.layoutInfo.totalItemsCount
+        if (atBottom && total > 0) list.scrollToItem(total - 1, Int.MAX_VALUE / 2)
+    }
 }

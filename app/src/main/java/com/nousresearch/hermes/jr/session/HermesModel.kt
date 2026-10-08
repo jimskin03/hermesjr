@@ -44,12 +44,53 @@ import org.json.JSONObject
 
 data class Bot(val name: String, val model: String, val sessionId: String, val isDefault: Boolean, val preview: String)
 data class Line(val role: String, val text: String)
-data class Chat(val profile: String, val sessionId: String, val lines: List<Line>, val draft: String, val streaming: Boolean)
+data class Chat(
+    val profile: String,
+    val sessionId: String,
+    val lines: List<Line>,
+    val draft: String,
+    val streaming: Boolean,
+    /** Reasoning/thinking deltas of the running turn, kept apart from the reply text. */
+    val reasoning: String = "",
+    /** The tool the running turn is using right now, for the "Using …" indicator. */
+    val activity: String = "",
+)
 data class RoomRow(val id: String, val name: String, val members: Int)
 data class Member(val id: String, val profile: String, val handle: String)
-data class RoomEvent(val seq: Int, val who: String, val text: String, val key: String = "")
+/**
+ * One user-visible line of a room transcript. [role] is "user", "bot" or "notice" (a subtle centered
+ * line for room lifecycle changes worth knowing about). Turn bookkeeping events are never RoomEvents.
+ */
+data class RoomEvent(
+    val seq: Int,
+    val who: String,
+    val text: String,
+    val key: String = "",
+    val role: String = "bot",
+    val eventId: String = "",
+    /** Epoch millis; 0 when unknown. */
+    val at: Long = 0L,
+    val profile: String = "",
+    /** Optimistic local echo the server has not confirmed yet. */
+    val sending: Boolean = false,
+)
 data class PendingAction(val kind: String, val memberId: String, val taskId: String, val generation: Int, val requestId: String, val choices: List<String>, val label: String)
-data class RoomView(val id: String, val name: String, val members: List<Member>, val events: List<RoomEvent>, val pending: List<PendingAction>, val working: Boolean, val live: String)
+data class RoomView(
+    val id: String,
+    val name: String,
+    val members: List<Member>,
+    val events: List<RoomEvent>,
+    val pending: List<PendingAction>,
+    val working: Boolean,
+    val live: String,
+    /** Who [live] (a streaming partial reply) belongs to. */
+    val liveWho: String = "",
+    /** Display names of members with a turn in flight ("@x is thinking…"). */
+    val thinking: List<String> = emptyList(),
+    /** member_id -> display name for members whose turn has started and not settled. */
+    val activeTurns: Map<String, String> = emptyMap(),
+    val loaded: Boolean = false,
+)
 data class MirrorRoom(val id: String, val name: String, val lines: List<String>, val omitted: Int)
 data class McpServer(val name: String, val source: String, val enabled: Boolean, val detail: String, val status: String)
 data class McpView(val profile: String, val servers: List<McpServer>, val catalog: List<Pair<String, String>>)
@@ -554,41 +595,73 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
             _state.value = _state.value.copy(
                 room = RoomView(id, row?.name ?: id, emptyList(), emptyList(), emptyList(), false, ""),
             )
-            var since = cursors[id] ?: 0
+            // Always rebuild the transcript from the server log: the local cursor only says what was
+            // seen, the visible history is not cached, so starting from it opened rooms empty.
+            var since = -1
             while (isActive && _state.value.room?.id == id) {
                 try {
                     val state = rpc("groups.state", JSONObject().put("room_id", id))
                     val room = state.optJSONObject("room") ?: JSONObject()
                     val driver = state.optJSONObject("driver_status")
                     val working = driver?.optBoolean("working") == true
-                    val log = rpc(
-                        "groups.log",
-                        JSONObject().put("room_id", id).put("since_seq", since).put("limit", 200),
-                    )
-                    val events = log.optJSONArray("events")?.objects().orEmpty()
-                    val current = _state.value.room ?: break
-                    var list = current.events
-                    events.forEach { event ->
-                        val seq = event.optInt("seq")
-                        if (seq > since) since = seq
-                        list = (list + eventLine(event)).takeLast(500)
+                    val members = membersOf(room.optJSONArray("members"))
+                    if (since < 0) since = (room.optInt("latest_seq", 0) - 400).coerceAtLeast(0)
+                    val events = mutableListOf<JSONObject>()
+                    for (page in 0 until 5) {
+                        val log = rpc(
+                            "groups.log",
+                            JSONObject().put("room_id", id).put("since_seq", since).put("limit", 200),
+                        )
+                        val batch = log.optJSONArray("events")?.objects().orEmpty()
+                        events += batch
+                        batch.forEach { event -> event.optInt("seq").let { if (it > since) since = it } }
+                        if (batch.size < 200) break
                     }
                     cursors[id] = since
+                    val current = _state.value.room ?: break
+                    var list = current.events
+                    var active = current.activeTurns
+                    var live = current.live
+                    var liveWho = current.liveWho
+                    events.forEach { event ->
+                        try {
+                            active = trackTurns(active, event, members)
+                            val line = eventLine(event, members) ?: return@forEach
+                            if (line.role == "bot" && line.who == liveWho) {
+                                live = ""
+                                liveWho = ""
+                            }
+                            list = mergeEvent(list, line)
+                        } catch (error: Exception) {
+                            JrLog.i("skip room event: ${error.javaClass.simpleName}")
+                        }
+                    }
+                    if (!working) {
+                        active = emptyMap()
+                        live = ""
+                        liveWho = ""
+                    }
                     val pending = pendingOf(driver?.optJSONArray("pending_actions"))
                     _state.value = _state.value.copy(
                         room = current.copy(
                             name = room.optString("name", current.name),
-                            members = membersOf(room.optJSONArray("members")),
-                            events = list,
+                            members = members,
+                            events = list.takeLast(500),
                             pending = pending,
                             working = working,
-                            live = if (events.any { it.optString("kind") == "message.member" }) "" else current.live,
+                            live = live,
+                            liveWho = liveWho,
+                            activeTurns = active,
+                            thinking = active.values.distinct(),
+                            loaded = true,
                         ),
                         offline = false,
                     )
                     remember()
                     syncRelay()
-                    delay(if (working) 1_000 else 5_000)
+                    delay(if (working) 1_000 else 4_000)
+                } catch (error: kotlinx.coroutines.CancellationException) {
+                    throw error
                 } catch (error: Exception) {
                     note(error.jr())
                     delay(5_000)
@@ -601,23 +674,39 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
         val room = _state.value.room ?: return
         val body = text.trim()
         if (body.isEmpty()) return
+        // The local echo carries the event_id sent to the server, and the server's message.user
+        // event comes back with that same id, so mergeEvent replaces the echo instead of adding a
+        // second copy (the duplicate "you" lines in #2's follow-up).
+        val eventId = ident()
+        val echo = RoomEvent(
+            seq = Int.MAX_VALUE,
+            who = "you",
+            text = body,
+            key = "e-$eventId",
+            role = "user",
+            eventId = eventId,
+            at = System.currentTimeMillis(),
+            sending = true,
+        )
+        _state.value.room?.takeIf { it.id == room.id }?.let { current ->
+            _state.value = _state.value.copy(room = current.copy(events = mergeEvent(current.events, echo).takeLast(500)))
+        }
         viewModelScope.launch(safe) {
             try {
                 rpc(
                     "groups.send",
-                    JSONObject().put("room_id", room.id).put("event_id", ident()).put(
+                    JSONObject().put("room_id", room.id).put("event_id", eventId).put(
                         "payload",
                         JSONObject().put("text", body).put("thread_id", "main"),
                     ),
                 )
-                val current = _state.value.room
-                if (current?.id == room.id) {
-                    _state.value = _state.value.copy(
-                        room = current.copy(events = (current.events + RoomEvent(current.events.size, "you", body, key = "local-${System.nanoTime()}")).takeLast(500)),
-                    )
-                }
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
             } catch (error: Exception) {
-                note(error.jr())
+                _state.value.room?.takeIf { it.id == room.id }?.let { current ->
+                    _state.value = _state.value.copy(room = current.copy(events = current.events.filterNot { it.eventId == eventId && it.sending }))
+                }
+                note("Not sent: ${error.jr()}")
             }
         }
     }
@@ -1014,9 +1103,16 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
                 _state.value = _state.value.copy(cards = _state.value.cards.filterNot { it.id == id })
                 syncRelay()
             }
-            "message.delta", "reasoning.delta", "thinking.delta" -> appendDraft(sid, payload.optString("text"))
-            "tool.start" -> appendLine(sid, Line("tool", payload.optString("name").ifBlank { "tool" }))
-            "tool.complete" -> appendLine(sid, Line("tool", payload.optString("summary").ifBlank { payload.optString("name") }))
+            "message.delta" -> appendDraft(sid, payload.optString("text"))
+            "reasoning.delta", "thinking.delta" -> appendReasoning(sid, payload.optString("text"))
+            "tool.start" -> {
+                setActivity(sid, payload.optString("name").ifBlank { "a tool" })
+                appendLine(sid, Line("tool", payload.optString("name").ifBlank { "tool" }))
+            }
+            "tool.complete" -> {
+                setActivity(sid, "")
+                appendLine(sid, Line("tool", payload.optString("summary").ifBlank { payload.optString("name") }))
+            }
             "message.complete", "error" -> finishTurn(sid, type, payload)
             "room.member.activity" -> onRoomActivity(payload)
             "display.status" -> {
@@ -1344,6 +1440,19 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
         _state.value = _state.value.copy(chat = chat.copy(draft = chat.draft + text, streaming = true))
     }
 
+    private fun appendReasoning(sid: String, text: String) {
+        if (text.isEmpty()) return
+        val chat = _state.value.chat ?: return
+        if (chat.sessionId != sid) return
+        _state.value = _state.value.copy(chat = chat.copy(reasoning = (chat.reasoning + text).takeLast(4_000), streaming = true))
+    }
+
+    private fun setActivity(sid: String, name: String) {
+        val chat = _state.value.chat ?: return
+        if (chat.sessionId != sid) return
+        _state.value = _state.value.copy(chat = chat.copy(activity = name, streaming = true))
+    }
+
     private fun appendLine(sid: String, line: Line) {
         val chat = _state.value.chat ?: return
         if (chat.sessionId != sid || line.text.isBlank()) return
@@ -1357,7 +1466,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
         if (chat?.sessionId == sid) {
             val draft = chat.draft
             val lines = if (draft.isNotBlank() && type != "message.complete") chat.lines + Line("assistant", draft) else chat.lines
-            _state.value = _state.value.copy(chat = chat.copy(lines = lines, draft = "", streaming = false))
+            _state.value = _state.value.copy(chat = chat.copy(lines = lines, draft = "", streaming = false, reasoning = "", activity = ""))
             if (type == "message.complete") {
                 viewModelScope.launch(safe) {
                     try {
@@ -1382,10 +1491,24 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
     private fun onRoomActivity(payload: JSONObject) {
         val room = _state.value.room ?: return
         if (payload.optString("room_id") != room.id) return
-        if (payload.optString("kind") != "message.delta") return
-        val text = payload.optJSONObject("payload")?.optString("text").orEmpty()
-        if (text.isEmpty()) return
-        _state.value = _state.value.copy(room = room.copy(live = room.live + text, working = true))
+        val memberId = payload.optString("member_id")
+        val who = room.members.find { it.id == memberId }?.let { memberName(it) }.orEmpty()
+        when (payload.optString("kind")) {
+            "message.delta" -> {
+                val text = payload.optJSONObject("payload")?.optString("text").orEmpty()
+                if (text.isEmpty()) return
+                val restart = who.isNotBlank() && who != room.liveWho
+                _state.value = _state.value.copy(
+                    room = room.copy(live = if (restart) text else room.live + text, liveWho = who.ifBlank { room.liveWho }, working = true),
+                )
+            }
+            "tool.started", "reasoning.delta", "message.interim" -> {
+                if (memberId.isBlank() || who.isBlank() || room.activeTurns.containsKey(memberId)) return
+                val active = room.activeTurns + (memberId to who)
+                _state.value = _state.value.copy(room = room.copy(activeTurns = active, thinking = active.values.distinct(), working = true))
+            }
+            else -> return
+        }
         syncRelay()
     }
 
@@ -1569,20 +1692,85 @@ private fun linesFrom(array: JSONArray?): List<Line> {
 private fun membersOf(array: JSONArray?): List<Member> =
     array?.objects().orEmpty().map { Member(it.optString("member_id"), it.optString("profile"), it.optString("handle")) }
 
-private fun eventLine(event: JSONObject): RoomEvent {
-    val actor = event.optJSONObject("actor")
-    val who = when (actor?.optString("kind")) {
-        "user" -> "you"
-        else -> actor?.optString("display_name").orEmpty().ifBlank { actor?.optString("profile").orEmpty() }.ifBlank { actor?.optString("id").orEmpty() }
+/** Name shown for a member: its @handle (what the room addresses it by), else its profile. */
+internal fun memberName(member: Member): String =
+    member.handle.ifBlank { member.profile }.ifBlank { "bot" }
+
+/** True for opaque machine ids (install:…, gateway ids, hex blobs) that must never be shown as a name. */
+internal fun looksLikeId(name: String): Boolean =
+    name.contains(':') || name.length >= 24 && name.all { it.isLetterOrDigit() || it == '-' || it == '_' }
+
+/**
+ * Turn bookkeeping for the "is thinking…" indicator: turn.started adds the member, any terminal
+ * event (settled / failed / cancelled / deferred / reassigned) or its message removes it.
+ */
+private fun trackTurns(active: Map<String, String>, event: JSONObject, members: List<Member>): Map<String, String> {
+    val payload = event.optJSONObject("payload") ?: return active
+    val memberId = payload.optString("member_id").ifBlank { event.optJSONObject("actor")?.optString("id").orEmpty() }
+    if (memberId.isBlank()) return active
+    return when (event.optString("kind")) {
+        "turn.started" -> active + (memberId to (members.find { it.id == memberId }?.let { memberName(it) } ?: "a bot"))
+        "turn.settled", "turn.failed", "turn.cancelled", "turn.deferred", "turn.reassigned", "message.member", "member.unavailable" -> active - memberId
+        else -> active
     }
+}
+
+/**
+ * Map one durable room-log event to a transcript line, or null when it is bookkeeping.
+ *
+ * Shown: message.user, message.member (the conversation), plus a few subtle notices: turn.failed,
+ * member.unavailable, room.renamed, room.members_changed, room.stop_requested, room.disbanded.
+ * Hidden: turn.started / settled / cancelled / deferred / reassigned, room.activity, room.created,
+ * authority.claimed / lost and anything unknown — the same split the server's own discussion
+ * transcript uses (only message.user and committed message.member are conversation).
+ */
+private fun eventLine(event: JSONObject, members: List<Member>): RoomEvent? {
+    val kind = event.optString("kind")
+    val actor = event.optJSONObject("actor") ?: JSONObject()
     val payload = event.optJSONObject("payload") ?: JSONObject()
-    val text = payload.optString("text").ifBlank { payload.optString("reason") }.ifBlank { event.optString("kind") }
-    return RoomEvent(
-        event.optInt("seq"),
-        who.ifBlank { event.optString("kind") },
-        text.take(4_000),
-        key = "s${event.optInt("seq")}-${event.optString("event_id")}",
-    )
+    val seq = event.optInt("seq")
+    val eventId = event.optString("event_id").ifBlank { "seq$seq" }
+    val at = (event.optDouble("created_at", 0.0) * 1000).toLong()
+    val memberId = payload.optString("member_id").ifBlank { actor.optString("id") }
+    val member = members.find { it.id == memberId }
+        ?: members.find { it.profile.isNotBlank() && it.profile == actor.optString("profile") }
+    val botName = member?.let { memberName(it) }
+        ?: actor.optString("display_name").takeIf { it.isNotBlank() && !looksLikeId(it) }
+        ?: actor.optString("profile").takeIf { it.isNotBlank() && !looksLikeId(it) }
+        ?: "bot"
+    fun notice(text: String) = RoomEvent(seq, "", text.take(400), key = "e-$eventId", role = "notice", eventId = eventId, at = at)
+    return when (kind) {
+        "message.user" -> {
+            val text = payload.optString("text")
+            if (text.isBlank()) null else RoomEvent(seq, "you", text.take(8_000), key = "e-$eventId", role = "user", eventId = eventId, at = at)
+        }
+        "message.member" -> {
+            val text = payload.optString("text")
+            if (text.isBlank()) null else RoomEvent(
+                seq, botName, text.take(16_000), key = "e-$eventId", role = "bot", eventId = eventId, at = at,
+                profile = member?.profile ?: actor.optString("profile"),
+            )
+        }
+        "turn.failed" -> notice("@$botName couldn't answer" + payload.optString("error").takeIf { it.isNotBlank() }?.let { ": ${it.take(200)}" }.orEmpty())
+        "member.unavailable" -> notice("@$botName is unavailable")
+        "room.renamed" -> notice("Room renamed" + payload.optString("name").takeIf { it.isNotBlank() }?.let { " to $it" }.orEmpty())
+        "room.members_changed" -> notice("Members changed")
+        "room.stop_requested" -> notice("Stopped")
+        "room.disbanded" -> notice("Room disbanded")
+        else -> null
+    }
+}
+
+/** Insert or replace by event id (a server echo replaces its optimistic local copy), kept in seq order. */
+internal fun mergeEvent(list: List<RoomEvent>, line: RoomEvent): List<RoomEvent> {
+    val index = list.indexOfFirst { it.eventId.isNotBlank() && it.eventId == line.eventId }
+    if (index >= 0) {
+        val old = list[index]
+        return list.toMutableList().also { it[index] = line.copy(at = if (line.at > 0) line.at else old.at) }
+            .sortedBy { it.seq }
+    }
+    if (list.isEmpty() || list.last().seq <= line.seq) return list + line
+    return (list + line).sortedBy { it.seq }
 }
 
 private fun pendingOf(array: JSONArray?): List<PendingAction> =
