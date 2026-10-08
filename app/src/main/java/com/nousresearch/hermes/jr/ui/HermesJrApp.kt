@@ -8,7 +8,10 @@ import android.graphics.BitmapFactory
 import android.net.ConnectivityManager
 import android.os.Build
 import android.util.Base64
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -60,6 +63,7 @@ import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -82,6 +86,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.nousresearch.hermes.jr.session.Card
 import com.nousresearch.hermes.jr.session.DEFAULT_BOT_ROUNDS
+import com.nousresearch.hermes.jr.session.DEFAULT_NOVNC_PORT
 import com.nousresearch.hermes.jr.session.HermesModel
 import com.nousresearch.hermes.jr.session.McpServer
 import com.nousresearch.hermes.jr.session.PendingAction
@@ -804,14 +809,37 @@ private fun ScreenPane(state: UiState, model: HermesModel) {
             if (!screen.supported) TextButton(onClick = model::grantComputerUse) { Text("Grant access", color = Accent) }
         }
         if (screen.pageUrl.isNotBlank()) {
+            val controlling by rememberUpdatedState(screen.controlling)
             AndroidView(
                 modifier = Modifier.fillMaxWidth().weight(1f),
                 factory = { ctx ->
                     WebView(ctx).apply {
                         settings.javaScriptEnabled = true
+                        // noVNC keeps its UI settings in localStorage.
+                        settings.domStorageEnabled = true
                         settings.allowFileAccess = false
                         settings.allowContentAccess = false
                         setBackgroundColor(0xFF0D1117.toInt())
+                        webViewClient = object : WebViewClient() {
+                            override fun onPageFinished(view: WebView?, url: String?) {
+                                view?.evaluateJavascript(JR_VIEWER_JS, null)
+                                view?.evaluateJavascript(jrControlJs(controlling), null)
+                            }
+
+                            // The viewer lives on the loopback page; anything else opens nowhere.
+                            override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean =
+                                request?.url?.host != "127.0.0.1"
+
+                            override fun onReceivedHttpError(
+                                view: WebView?,
+                                request: WebResourceRequest?,
+                                errorResponse: WebResourceResponse?,
+                            ) {
+                                if (request?.isForMainFrame == true) {
+                                    model.viewerFailed("HTTP ${errorResponse?.statusCode ?: 0}")
+                                }
+                            }
+                        }
                     }
                 },
                 update = { view ->
@@ -819,7 +847,7 @@ private fun ScreenPane(state: UiState, model: HermesModel) {
                         view.tag = screen.pageUrl
                         view.loadUrl(screen.pageUrl)
                     }
-                    view.evaluateJavascript("if (window.jrSetControl) window.jrSetControl(${screen.controlling});", null)
+                    view.evaluateJavascript(jrControlJs(screen.controlling), null)
                 },
             )
         } else if (screen.thumbnail.startsWith("data:")) {
@@ -845,11 +873,35 @@ private fun MorePane(state: UiState, model: HermesModel) {
             Text("Use this computer")
         }
         TextButton(onClick = model::signOut) { Text("Sign out", color = Danger) }
+        ScreenViewerSetting(state, model)
         Text("Keep the computer's gateway up", color = Ink, fontWeight = FontWeight.SemiBold)
         GatewaySetup()
         Text("Lost phone", color = Ink, fontWeight = FontWeight.SemiBold)
         Text(SetupCopy.LOST_PHONE, color = Muted, fontSize = 13.sp)
     }
+}
+
+/** Where the Screen tab loads noVNC from. The computer serves it; this APK carries no viewer. */
+@Composable
+private fun ScreenViewerSetting(state: UiState, model: HermesModel) {
+    var novnc by rememberSaveable(state.novncUrl) { mutableStateOf(state.novncUrl) }
+    Text("Screen viewer", color = Ink, fontWeight = FontWeight.SemiBold)
+    Text(
+        "The Screen tab loads noVNC from your computer (websockify --web=/usr/share/novnc). " +
+            "Leave blank for this computer on port $DEFAULT_NOVNC_PORT, or enter a port, host:port, or URL.",
+        color = Muted,
+        fontSize = 13.sp,
+    )
+    OutlinedTextField(
+        novnc,
+        { novnc = it },
+        label = { Text("noVNC viewer") },
+        placeholder = { Text("$DEFAULT_NOVNC_PORT", color = Muted) },
+        singleLine = true,
+        modifier = Modifier.fillMaxWidth(),
+        colors = fieldColors(),
+    )
+    TextButton(onClick = { model.setNovncUrl(novnc) }) { Text("Save viewer address", color = Accent) }
 }
 
 @Composable

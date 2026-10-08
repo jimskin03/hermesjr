@@ -19,6 +19,11 @@ class JrStore(context: Context) {
         val roomEvents: String = "",
         /** JSON object room_id -> max bot rounds (this phone's bot-to-bot follow-up budget). */
         val roomRounds: String = "{}",
+        /**
+         * Where the computer serves the noVNC viewer files (`websockify --web=/usr/share/novnc`).
+         * Blank means the default: the gateway's host on port 6080.
+         */
+        val novncUrl: String = "",
     )
 
     suspend fun read(): Saved {
@@ -30,6 +35,7 @@ class JrStore(context: Context) {
             transcript = prefs[TRANSCRIPT].orEmpty(),
             roomEvents = prefs[ROOMS].orEmpty(),
             roomRounds = prefs[ROUNDS] ?: "{}",
+            novncUrl = prefs[NOVNC].orEmpty(),
         )
     }
 
@@ -53,11 +59,18 @@ class JrStore(context: Context) {
         store.edit { it[ROUNDS] = json }
     }
 
+    suspend fun saveNovncUrl(url: String) {
+        store.edit { it[NOVNC] = url }
+    }
+
+    /** Clears the session but keeps the device settings: the computer address and its noVNC viewer. */
     suspend fun wipeSession() {
         store.edit {
             val url = it[URL]
+            val novnc = it[NOVNC]
             it.clear()
             if (url != null) it[URL] = url
+            if (novnc != null) it[NOVNC] = novnc
         }
     }
 
@@ -68,5 +81,6 @@ class JrStore(context: Context) {
         val TRANSCRIPT = stringPreferencesKey("transcript")
         val ROOMS = stringPreferencesKey("room_events")
         val ROUNDS = stringPreferencesKey("room_rounds")
+        val NOVNC = stringPreferencesKey("novnc_url")
     }
 }

@@ -140,6 +140,8 @@ data class UiState(
     val mcp: McpView? = null,
     val cards: List<Card> = emptyList(),
     val screen: ScreenState = ScreenState(),
+    /** The saved noVNC viewer address as typed (blank = gateway host, port [DEFAULT_NOVNC_PORT]). */
+    val novncUrl: String = "",
 )
 
 class HermesModel(app: Application) : AndroidViewModel(app) {
@@ -147,7 +149,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
     private val http = GatewayHttp(app, tokens)
     private val store = JrStore(app)
     private val rpc = RpcSocket()
-    private val bridge = RfbBridge(app.assets)
+    private val bridge = RfbBridge()
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state.asStateFlow()
 
@@ -186,6 +188,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
     private var lastRfbMs = 0L
     private var relayWaiting: Boolean? = null
     private var intentionalBridgeClose = false
+    private var novncSetting = ""
 
     init {
         rpc.onEvent = { frame -> viewModelScope.launch(safe + Dispatchers.Main.immediate) { onFrame(frame) } }
@@ -216,13 +219,14 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch(safe) {
             val saved = store.read()
             base = saved.baseUrl
+            novncSetting = saved.novncUrl
             parseCursors(saved.cursors)
             try {
                 val json = JSONObject(saved.roomRounds)
                 json.keys().forEach { key -> roomRounds[key] = json.optInt(key, DEFAULT_BOT_ROUNDS).coerceIn(1, 10) }
             } catch (_: Exception) {
             }
-            _state.value = _state.value.copy(baseUrl = saved.baseUrl, booting = false)
+            _state.value = _state.value.copy(baseUrl = saved.baseUrl, novncUrl = saved.novncUrl, booting = false)
             if (saved.baseUrl.isNotBlank() && tokens.read() != null) useHost(saved.baseUrl)
         }
     }
@@ -400,7 +404,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
         viewerId = ""
         viewModelScope.launch(safe) { store.wipeSession() }
         stopRelay()
-        _state.value = UiState(booting = false, baseUrl = base, notice = "Signed out on this phone.")
+        _state.value = UiState(booting = false, baseUrl = base, novncUrl = novncSetting, notice = "Signed out on this phone.")
     }
 
     fun dismissNotice() {
@@ -1116,6 +1120,61 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Saves where the computer serves noVNC. Accepts blank (default), a port, host:port, or a URL;
+     * a pasted `.../vnc.html` is trimmed to its folder.
+     */
+    fun setNovncUrl(raw: String) {
+        val trimmed = raw.trim()
+        if (trimmed.isNotBlank()) {
+            val resolved = try {
+                novncBase(trimmed, base)
+            } catch (_: Exception) {
+                note("That noVNC address is not a valid URL.")
+                return
+            }
+            val host = try { URI(resolved).host } catch (_: Exception) { null }
+            if (host == null) {
+                note("That noVNC address is not a host.")
+                return
+            }
+            if (hostIsPhoneLoopback(host)) {
+                note("That noVNC address is this phone. Use the computer's address.")
+                return
+            }
+        }
+        novncSetting = trimmed
+        _state.value = _state.value.copy(novncUrl = trimmed)
+        viewModelScope.launch(safe) {
+            store.saveNovncUrl(trimmed)
+            note("Screen viewer: ${viewerBaseOrNull() ?: "set after you connect"}")
+            if (screenWanted) {
+                releaseBridge()
+                _state.value = _state.value.copy(screen = _state.value.screen.copy(pageUrl = ""))
+                runScreen(_state.value.screen.profile, screenMetered)
+            }
+        }
+    }
+
+    /** The noVNC page failed to load in the WebView (e.g. the computer stopped serving it). */
+    fun viewerFailed(why: String) {
+        if (!screenWanted || _state.value.screen.pageUrl.isBlank()) return
+        JrLog.i("novnc page failed: $why")
+        releaseBridge()
+        val viewer = viewerBaseOrNull().orEmpty()
+        _state.value = _state.value.copy(
+            screen = _state.value.screen.copy(pageUrl = "", message = novncMissing(viewer, why)),
+        )
+        watchThumbnails(_state.value.screen.profile)
+    }
+
+    /** The computer's noVNC web root (ending in `/`), or null before a computer is set. */
+    private fun viewerBaseOrNull(): String? = try {
+        novncBase(novncSetting, base)
+    } catch (_: Exception) {
+        null
+    }
+
     override fun onCleared() {
         wantSocket = false
         rpc.close(notify = false)
@@ -1372,6 +1431,16 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun attachRfb(profile: String, screen: ScreenState, passViewer: Boolean): ScreenState {
+        // The viewer files come from the computer (websockify --web), not from this APK. Check first,
+        // so a computer without noVNC gets a clear message and keeps the screenshot fallback.
+        val viewerBase = viewerBaseOrNull()
+            ?: return screen.copy(pageUrl = "", message = "Set the Screen viewer address in More.")
+        val missing = io { bridge.probe(viewerBase) }
+        if (missing != null) {
+            JrLog.i("novnc viewer missing: $missing")
+            releaseBridge()
+            return screen.copy(pageUrl = "", message = novncMissing(viewerBase, missing))
+        }
         val params = JSONObject().put("profile", profile)
         if (passViewer && viewerId.isNotBlank()) params.put("viewer_id", viewerId)
         val observed = rpc("display.observe", params, 60_000)
@@ -1381,7 +1450,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
         val upstream = base.trimEnd('/').replaceFirst("https://", "wss://").replaceFirst("http://", "ws://") +
             "/api/display/ws?display_ticket=" + enc(ticket)
         intentionalBridgeClose = true
-        val page = bridge.open(upstream)
+        val page = bridge.open(upstream, viewerBase)
         intentionalBridgeClose = false
         lastRfbMs = System.currentTimeMillis()
         watchStall(profile)
@@ -1455,6 +1524,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
             try {
                 val screen = attachRfb(_state.value.screen.profile, _state.value.screen, passViewer = true)
                 _state.value = _state.value.copy(screen = screen)
+                if (screen.pageUrl.isBlank()) watchThumbnails(screen.profile)
             } catch (error: Exception) {
                 note(error.jr())
             }
@@ -1739,6 +1809,41 @@ private fun normalizeBase(raw: String): String {
 private fun ident(): String = "jr" + UUID.randomUUID().toString().replace("-", "")
 
 private fun enc(value: String): String = URLEncoder.encode(value, "UTF-8")
+
+/** websockify's usual noVNC port; README "Screen viewer" starts it there. */
+const val DEFAULT_NOVNC_PORT = 6080
+
+/**
+ * Resolves the Screen viewer setting against the gateway [gateway] URL. Blank -> gateway host on
+ * [DEFAULT_NOVNC_PORT]; "6081" -> gateway host on that port; "host:port" -> http://host:port/;
+ * a full URL is kept (a trailing `vnc.html` is dropped). Always ends in `/`.
+ */
+fun novncBase(setting: String, gateway: String): String {
+    val raw = setting.trim()
+    val gatewayUri = if (gateway.isBlank()) null else URI(gateway)
+    val url = when {
+        raw.isBlank() || raw.all { it.isDigit() } -> {
+            val host = gatewayUri?.host ?: throw IllegalStateException("no computer yet")
+            val port = if (raw.isBlank()) DEFAULT_NOVNC_PORT else raw.toInt()
+            require(port in 1..65535)
+            val bracketed = if (host.contains(':') && !host.startsWith("[")) "[$host]" else host
+            "http://$bracketed:$port/"
+        }
+        raw.startsWith("http://", ignoreCase = true) || raw.startsWith("https://", ignoreCase = true) -> raw
+        else -> "http://$raw"
+    }
+    var cleaned = url.substringBefore('#').substringBefore('?')
+    if (cleaned.endsWith("vnc.html")) cleaned = cleaned.substringBeforeLast('/')
+    if (!cleaned.endsWith("/")) cleaned += "/"
+    val check = URI(cleaned)
+    require(check.host != null)
+    return cleaned
+}
+
+private fun novncMissing(viewerBase: String, why: String): String =
+    "Your computer is not serving the noVNC viewer at $viewerBase ($why). " +
+        "Install the novnc and websockify packages on the computer and start the viewer " +
+        "(README, Screen viewer). Screenshots keep updating meanwhile. Change the address in More."
 
 private fun strings(array: JSONArray?): List<String> {
     if (array == null) return emptyList()

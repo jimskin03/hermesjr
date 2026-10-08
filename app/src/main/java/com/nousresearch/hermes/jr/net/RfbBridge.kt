@@ -1,6 +1,5 @@
 package com.nousresearch.hermes.jr.net
 
-import android.content.res.AssetManager
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -21,14 +20,25 @@ import java.util.concurrent.atomic.AtomicBoolean
 import android.util.Base64
 
 /**
- * Loopback noVNC page. The display ticket is appended only on the hop to the computer.
- * The page URL carries an unguessable path and nothing else.
+ * Loopback noVNC page. The viewer files (vnc.html, app/, core/, vendor/) are not bundled: they are
+ * fetched from the computer's own noVNC install, served by `websockify --web=/usr/share/novnc`
+ * (see README, "Screen viewer"). Like Friendly, `app/ui.js` gets a one-line hook appended so the
+ * app can reach noVNC's UI object (`globalThis.__novncUI`).
+ *
+ * The picture itself never touches that port: `<token>/ws` is spliced to hermes serve's ticketed
+ * `/api/display/ws`. The display ticket is appended only on the hop to the computer. The page URL
+ * carries an unguessable path and nothing else.
  */
-class RfbBridge(private val assets: AssetManager) {
+class RfbBridge {
     private val http = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .addNetworkInterceptor(CleartextInterceptor())
+        .build()
+    /** Short timeouts for the viewer files; the picture socket above has none. */
+    private val web = http.newBuilder()
+        .readTimeout(10, TimeUnit.SECONDS)
+        .callTimeout(20, TimeUnit.SECONDS)
         .build()
     private val random = SecureRandom()
     @Volatile private var server: ServerSocket? = null
@@ -39,7 +49,29 @@ class RfbBridge(private val assets: AssetManager) {
     var onUpstreamClose: (Int) -> Unit = {}
     var onActivity: () -> Unit = {}
 
-    fun open(upstreamUrl: String): String {
+    /**
+     * Blocking check that [viewerBase] serves noVNC. Returns null when `vnc.html` and `app/ui.js`
+     * load, otherwise a short reason (HTTP status or the I/O failure).
+     */
+    fun probe(viewerBase: String): String? {
+        for (file in listOf("vnc.html", "app/ui.js")) {
+            val reason = try {
+                web.newCall(Request.Builder().url(viewerBase + file).get().build()).execute().use { response ->
+                    if (response.isSuccessful) null else "HTTP ${response.code} for /$file"
+                }
+            } catch (error: Exception) {
+                error.message?.take(160) ?: error.javaClass.simpleName
+            }
+            if (reason != null) return reason
+        }
+        return null
+    }
+
+    /**
+     * Opens the loopback page. [viewerBase] is the computer's noVNC web root URL, ending in `/`.
+     * Returns the page URL with noVNC's own query settings (autoconnect, scale, view-only start).
+     */
+    fun open(upstreamUrl: String, viewerBase: String): String {
         close()
         stopped = false
         wsTaken.set(false)
@@ -53,10 +85,15 @@ class RfbBridge(private val assets: AssetManager) {
                 } catch (_: Exception) {
                     break
                 }
-                Thread({ handle(client, token, upstreamUrl) }, "hermes-jr-rfb").apply { isDaemon = true }.start()
+                Thread({ handle(client, token, upstreamUrl, viewerBase) }, "hermes-jr-rfb").apply { isDaemon = true }.start()
             }
         }, "hermes-jr-rfb-accept").apply { isDaemon = true }.start()
-        return "http://127.0.0.1:${bound.localPort}/$token/vnc.html"
+        // host/port are spelled out: older noVNC needs them, and newer noVNC resolves a bare path
+        // relative to vnc.html. path picks the splice below.
+        val port = bound.localPort
+        return "http://127.0.0.1:$port/$token/vnc.html" +
+            "?autoconnect=1&reconnect=0&resize=scale&view_only=1&show_dot=1&encrypt=0" +
+            "&host=127.0.0.1&port=$port&path=$token/ws"
     }
 
     fun close() {
@@ -76,7 +113,7 @@ class RfbBridge(private val assets: AssetManager) {
         upstream = null
     }
 
-    private fun handle(socket: Socket, token: String, upstreamUrl: String) {
+    private fun handle(socket: Socket, token: String, upstreamUrl: String, viewerBase: String) {
         socket.use { client ->
             client.tcpNoDelay = true
             val head = readHead(client.getInputStream()) ?: return
@@ -102,28 +139,49 @@ class RfbBridge(private val assets: AssetManager) {
                 wsTaken.set(false)
                 return
             }
-            val asset = "novnc/$rel"
-            val bytes = try {
-                assets.open(asset).use { it.readBytes() }
-            } catch (_: Exception) {
-                writeStatus(client, 404, "Not Found"); return
+            if (!parts[0].equals("GET", ignoreCase = true)) {
+                writeStatus(client, 405, "Method Not Allowed"); return
             }
-            val type = when {
-                rel.endsWith(".js") -> "text/javascript; charset=utf-8"
-                rel.endsWith(".html") -> "text/html; charset=utf-8"
-                rel.endsWith(".css") -> "text/css"
-                rel.endsWith(".svg") -> "image/svg+xml"
-                rel.endsWith(".png") -> "image/png"
-                rel.endsWith(".woff2") -> "font/woff2"
-                rel.endsWith(".woff") -> "font/woff"
-                else -> "application/octet-stream"
-            }
-            val header = "HTTP/1.1 200 OK\r\nContent-Type: $type\r\nContent-Length: ${bytes.size}\r\nConnection: close\r\n\r\n"
-            val out = client.getOutputStream()
-            out.write(header.toByteArray(Charsets.ISO_8859_1))
-            out.write(bytes)
-            out.flush()
+            serveViewerFile(client, viewerBase, rel)
         }
+    }
+
+    /** Streams one noVNC file from the computer to the WebView, hooking `app/ui.js` on the way. */
+    private fun serveViewerFile(client: Socket, viewerBase: String, rel: String) {
+        val out = client.getOutputStream()
+        try {
+            web.newCall(Request.Builder().url(viewerBase + rel).get().build()).execute().use { response ->
+                if (!response.isSuccessful) {
+                    writeStatus(client, response.code, if (response.code == 404) "Not Found" else "Upstream Error")
+                    return
+                }
+                var bytes = response.body?.bytes() ?: ByteArray(0)
+                if (rel == "app/ui.js") bytes += UI_HOOK.toByteArray(Charsets.UTF_8)
+                val type = response.header("Content-Type") ?: typeOf(rel)
+                val header = "HTTP/1.1 200 OK\r\nContent-Type: $type\r\nContent-Length: ${bytes.size}\r\n" +
+                    "Cache-Control: no-store\r\nConnection: close\r\n\r\n"
+                out.write(header.toByteArray(Charsets.ISO_8859_1))
+                out.write(bytes)
+                out.flush()
+            }
+        } catch (error: Exception) {
+            JrLog.i("viewer file failed ${error.javaClass.simpleName}")
+            writeStatus(client, 502, "Bad Gateway")
+        }
+    }
+
+    private fun typeOf(rel: String): String = when {
+        rel.endsWith(".js") -> "text/javascript; charset=utf-8"
+        rel.endsWith(".html") -> "text/html; charset=utf-8"
+        rel.endsWith(".css") -> "text/css"
+        rel.endsWith(".json") -> "application/json"
+        rel.endsWith(".svg") -> "image/svg+xml"
+        rel.endsWith(".png") -> "image/png"
+        rel.endsWith(".woff2") -> "font/woff2"
+        rel.endsWith(".woff") -> "font/woff"
+        rel.endsWith(".mp3") -> "audio/mpeg"
+        rel.endsWith(".oga") -> "audio/ogg"
+        else -> "application/octet-stream"
     }
 
     private fun bridge(client: Socket, head: String, upstreamUrl: String) {
@@ -318,5 +376,7 @@ class RfbBridge(private val assets: AssetManager) {
     private companion object {
         const val GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
         const val CUT = 256 * 1024
+        /** Same hook as Friendly's DesktopControlSheet: noVNC keeps UI inside an ES module. */
+        const val UI_HOOK = "\nglobalThis.__novncUI = UI;\n"
     }
 }

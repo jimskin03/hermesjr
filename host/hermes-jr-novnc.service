@@ -1,0 +1,20 @@
+# systemd user unit for the Hermes Jr Screen viewer (noVNC files only).
+# Install:
+#   mkdir -p ~/.local/bin ~/.config/systemd/user
+#   cp host/serve-novnc.sh ~/.local/bin/hermes-jr-serve-novnc && chmod +x ~/.local/bin/hermes-jr-serve-novnc
+#   cp host/hermes-jr-novnc.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now hermes-jr-novnc.service
+[Unit]
+Description=noVNC viewer files for Hermes Jr (websockify --web)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+# Optional overrides: NOVNC_WEB_ROOT, NOVNC_PORT, NOVNC_BIND
+Environment=NOVNC_PORT=6080
+ExecStart=%h/.local/bin/hermes-jr-serve-novnc
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

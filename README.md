@@ -10,8 +10,8 @@ Four tabs:
 
 - **Chats.** Talk to one bot, or to a group room on the computer. Attach a file from the phone. Desktop group rooms that are only saved locally are shown read-only.
 - **Bots.** Create and delete bots on the computer. Open MCP servers from a bot row: list, add, remove, enable, and test.
-- **Screen.** Watch the computer's desktop. On Linux this is the Bot Desktop over a loopback picture. Take over is a separate button. On other systems, screenshots still show up in the bot chat.
-- **More.** The saved computer address, sign-out, and the setup notes below.
+- **Screen.** Watch the computer's desktop. On Linux this is the Bot Desktop, drawn by the noVNC viewer that your computer serves (see [Screen viewer](#screen-viewer)). Take over is a separate button. Without the viewer, the tab shows a refreshing screenshot and says what to install. On other systems, screenshots still show up in the bot chat.
+- **More.** The saved computer address, the Screen viewer address, sign-out, and the setup notes below.
 
 While a bot is working, or the computer is waiting on you, a foreground notice stays up. Approval, sudo, secret, clarify, and vault prompts are cards. A swipe does not approve them.
 
@@ -62,6 +62,27 @@ Put the basic-auth values in the environment the unit loads, not in the shell yo
 
 On a tailnet, bind `--host` to the computer's Tailscale address instead of `0.0.0.0`. An IPv6 address in the phone URL is bracketed: `http://[fd7a:115c:a1e0::1234]:9119`.
 
+## Screen viewer
+
+The app does not bundle noVNC. Like Friendly, it loads the viewer from the computer, served by `websockify --web=/usr/share/novnc`. The picture itself still goes through `hermes serve` (`/api/display/ws`, single-use ticket, input only while you hold the lease); the websockify port only serves the noVNC files and refuses every WebSocket.
+
+On the computer (Debian/Ubuntu):
+
+```bash
+sudo apt install novnc websockify
+websockify --web=/usr/share/novnc --heartbeat=30 \
+  --token-plugin=TokenFile --token-source=/dev/null \
+  "$(tailscale ip -4):6080"
+```
+
+Check it from another device on the tailnet: `http://<computer>:6080/vnc.html` should load the noVNC page.
+
+`host/serve-novnc.sh` runs the same command and checks the install first. It binds to the Tailscale IPv4 when `tailscale` is present, else `0.0.0.0`; override with `NOVNC_BIND`, `NOVNC_PORT` (default 6080), and `NOVNC_WEB_ROOT` (default `/usr/share/novnc`). To keep it up, use the systemd user unit in `host/hermes-jr-novnc.service`; the install steps are at the top of that file. If your distribution has no `novnc` package, clone [noVNC](https://github.com/novnc/noVNC) and point `NOVNC_WEB_ROOT` at it (the folder must contain `vnc.html`), and `pipx install websockify`.
+
+On the phone, **More → Screen viewer** says where to load it from. Blank means the computer you connected to, port 6080. You can enter a port (`6081`), `host:port`, or a URL such as an `https://` Tailscale Serve address. If the Screen tab says the computer is not serving the viewer, start it there and open the tab again.
+
+The Screen tab adds two small hooks to the page it loads, as Friendly does: `app/ui.js` gets `globalThis.__novncUI = UI;` appended, and a short script hides noVNC's control bar and keeps it view-only until you tap Take over.
+
 ## Connect from the phone
 
 Paste the computer's address, for example `http://192.168.100.57:9119`, and tap Connect, then Sign in.
@@ -94,4 +115,4 @@ Release builds minify and shrink resources.
 
 ## Layout
 
-Kotlin and Jetpack Compose. AGP 9.4.1, Kotlin 2.4.10, Compose BOM 2026.09.00. The gateway speaks JSON-RPC over a ticketed WebSocket. The screen picture is noVNC 1.5.0, vendored under `app/src/main/assets/novnc/` (MPL-2.0). The rest of this repository is MIT; see `LICENSE`.
+Kotlin and Jetpack Compose. AGP 9.4.1, Kotlin 2.4.10, Compose BOM 2026.09.00. The gateway speaks JSON-RPC over a ticketed WebSocket. The screen picture is drawn by the noVNC that the computer serves (see Screen viewer); no noVNC code ships in the APK. This repository is MIT; see `LICENSE`. `host/` holds the viewer script and systemd unit.
