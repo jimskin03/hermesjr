@@ -196,6 +196,8 @@ private fun ConnectScreen(state: UiState, model: HermesModel) {
         }
         if (state.signingIn) {
             Text("Finish signing in in the browser. If you closed it, tap Sign in again.", color = Muted, fontSize = 13.sp)
+        } else if (state.signedIn) {
+            Text("Signed in. Opening the chat connection to ${state.baseUrl}…", color = Muted, fontSize = 13.sp)
         } else if (state.baseUrl.isNotBlank()) {
             Text("Connected probe saved for ${state.baseUrl}. Sign in to open chats.", color = Muted, fontSize = 13.sp)
         }

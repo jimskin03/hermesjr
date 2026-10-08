@@ -15,7 +15,9 @@ import com.nousresearch.hermes.jr.net.RpcException
 import com.nousresearch.hermes.jr.net.RpcSocket
 import com.nousresearch.hermes.jr.net.TokenStore
 import com.nousresearch.hermes.jr.net.addressesArePrivate
+import com.nousresearch.hermes.jr.net.NetFailure
 import com.nousresearch.hermes.jr.net.awaitLoopback
+import com.nousresearch.hermes.jr.net.whereOf
 import com.nousresearch.hermes.jr.net.hostIsPhoneLoopback
 import com.nousresearch.hermes.jr.net.objects
 import com.nousresearch.hermes.jr.relay.RelayService
@@ -70,6 +72,8 @@ data class UiState(
     val busy: Boolean = false,
     /** Browser sign-in is open and the app is waiting for the loopback callback. */
     val signingIn: Boolean = false,
+    /** Tokens are stored; the app is (re)opening the chat WebSocket. */
+    val signedIn: Boolean = false,
     val ready: Boolean = false,
     val baseUrl: String = "",
     val notice: String = "",
@@ -124,7 +128,15 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
         rpc.onClosed = {
             viewModelScope.launch(Dispatchers.Main.immediate) {
                 if (!wantSocket) return@launch
-                _state.value = _state.value.copy(offline = true)
+                val why = rpc.lastError
+                if (why.isNotBlank()) JrLog.i("ws lost: $why")
+                // Before the first gateway.ready the connect screen is still up and has no offline
+                // banner, so say why the chat connection is not coming up.
+                _state.value = if (!_state.value.ready && why.isNotBlank()) {
+                    _state.value.copy(offline = true, notice = "Signed in, but the chat connection failed: $why. Retrying.")
+                } else {
+                    _state.value.copy(offline = true)
+                }
                 pingJob?.cancel()
                 delay(1_000)
                 if (wantSocket) openSocket()
@@ -212,7 +224,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
                     note = "This computer answers over plain HTTP, not HTTPS. Using $normalized."
                 }
                 val signedIn = tokens.read() != null
-                _state.value = _state.value.copy(busy = false, baseUrl = normalized, ready = false, notice = note)
+                _state.value = _state.value.copy(busy = false, baseUrl = normalized, ready = false, signedIn = signedIn, notice = note)
                 if (signedIn) {
                     wantSocket = true
                     openSocket()
@@ -285,7 +297,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
                 if (tokens.read() == null) errorNotice("$stage: the stored sign-in could not be read back.")
                 JrLog.i("sign-in complete")
                 wantSocket = true
-                _state.value = _state.value.copy(busy = false)
+                _state.value = _state.value.copy(busy = false, signedIn = true)
                 openSocket()
             } catch (error: kotlinx.coroutines.CancellationException) {
                 throw error
@@ -956,6 +968,18 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
             if (epoch != socketEpoch) return
             rpc.connect(base, ticket)
             _state.value = _state.value.copy(busy = false)
+            viewModelScope.launch {
+                delay(20_000)
+                if (epoch == socketEpoch && wantSocket && readyEpoch != epoch && !_state.value.ready) {
+                    val detail = if (rpc.opened) {
+                        "the chat connection opened, but the computer never said it was ready (${whereOf("$base/api/ws")})"
+                    } else {
+                        rpc.lastError.ifBlank { "the chat connection did not open (${whereOf("$base/api/ws")})" }
+                    }
+                    JrLog.i("ws not ready after 20s opened=${rpc.opened}")
+                    _state.value = _state.value.copy(notice = "Signed in, but $detail. Still trying.")
+                }
+            }
         } catch (error: Exception) {
             _state.value = _state.value.copy(offline = true, busy = false, notice = error.jr())
             if (wantSocket && epoch == socketEpoch) {
@@ -1449,7 +1473,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
             if (error.code == 401) {
                 wantSocket = false
                 tokens.clear()
-                _state.value = _state.value.copy(ready = false, offline = false, notice = "Signed out")
+                _state.value = _state.value.copy(ready = false, signedIn = false, offline = false, notice = "Signed out")
                 stopRelay()
             }
             throw error
@@ -1468,10 +1492,11 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
 
     private fun Throwable.jr(): String = when (this) {
         is Notice -> message.orEmpty()
+        is NetFailure -> "${original.jr().trimEnd('.')} (${where})"
         is RpcException -> message?.take(300)?.ifBlank { null } ?: "The computer rejected that."
         is java.net.SocketTimeoutException -> "The computer did not answer."
         is javax.net.ssl.SSLException -> "HTTPS failed (${message?.take(120) ?: javaClass.simpleName}). If hermes serve runs without TLS, use http:// instead."
-        is java.net.ConnectException -> "${message?.take(160) ?: "Could not connect"}. Check the address, the port, and that hermes serve is running."
+        is java.net.ConnectException -> "ConnectException: ${message?.take(160) ?: "could not connect"}. Check the address, the port, and that hermes serve is running"
         is java.net.UnknownHostException -> "Could not find that computer."
         is java.io.IOException -> message?.take(180)?.ifBlank { null } ?: "Could not reach the computer (${javaClass.simpleName})."
         else -> "${javaClass.simpleName}: ${message?.take(200).orEmpty()}".trimEnd(':', ' ')

@@ -45,6 +45,18 @@ object JrLog {
 
 class RpcException(val code: Int, message: String, val data: JSONObject?) : Exception(message)
 
+/** An I/O failure tagged with the host:port (and path) it was talking to, so the UI can name it. */
+class NetFailure(val where: String, val original: java.io.IOException) :
+    java.io.IOException("${original.javaClass.simpleName}: ${original.message.orEmpty()} ($where)", original)
+
+fun whereOf(url: String): String = try {
+    val u = java.net.URI(url)
+    val port = if (u.port == -1) (if (u.scheme == "https" || u.scheme == "wss") 443 else 80) else u.port
+    "${u.host}:$port${u.path.orEmpty()}"
+} catch (_: Exception) {
+    url
+}
+
 fun isPrivateAddress(address: InetAddress): Boolean {
     if (address.isLoopbackAddress) return true
     val bytes = address.address
@@ -174,6 +186,9 @@ class RpcSocket {
     @Volatile var socket: WebSocket? = null
     @Volatile var declinesNotShown: Boolean? = null
     @Volatile var lastInboundMs: Long = System.currentTimeMillis()
+    /** Last socket failure, e.g. "ConnectException: Connection refused (100.96.46.109:9119/api/ws)". */
+    @Volatile var lastError: String = ""
+    @Volatile var opened: Boolean = false
     var onEvent: (JSONObject) -> Unit = {}
     var onServerRequest: (String, String, JSONObject) -> Unit = { _, _, _ -> }
     var onClosed: (Int) -> Unit = {}
@@ -191,7 +206,13 @@ class RpcSocket {
             .header("Sec-WebSocket-Protocol", "hermes-gateway-v1, hermes-gateway-ticket.$ticket")
             .build()
         lastInboundMs = System.currentTimeMillis()
+        lastError = ""
+        opened = false
+        val where = whereOf(wsUrl)
         socket = http.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                if (gen == listenerGen) opened = true
+            }
             override fun onMessage(webSocket: WebSocket, text: String) {
                 if (gen == listenerGen) ingest(text)
             }
@@ -199,11 +220,19 @@ class RpcSocket {
                 if (gen == listenerGen) ingest(bytes.utf8())
             }
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                if (gen == listenerGen) lastError = "The computer closed the connection ($code${if (reason.isNotBlank()) " $reason" else ""}, $where)"
                 webSocket.close(code, null)
             }
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = finish(code)
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                JrLog.i("ws failed ${t.javaClass.simpleName}")
+                JrLog.i("ws failed ${t.javaClass.simpleName} ${response?.code ?: ""}")
+                if (gen == listenerGen) {
+                    lastError = if (response != null) {
+                        "The computer refused the chat connection (HTTP ${response.code}, $where)"
+                    } else {
+                        "${t.javaClass.simpleName}: ${t.message.orEmpty()} ($where)"
+                    }
+                }
                 finish(response?.code ?: -1)
             }
 
@@ -267,22 +296,32 @@ class RpcSocket {
         queued.forEach { (id, method, params) -> dispatchWindow(id, method, params) }
     }
 
+    /**
+     * hermes serve's /api/ws sends exactly one JSON-RPC object per WebSocket text message and does
+     * NOT append a newline (only the stdio transport does). Treat every message as complete, and
+     * still split newline-delimited batches. A trailing fragment that does not parse is kept and
+     * joined with the next message, in case a server ever splits one frame across messages.
+     */
     private fun ingest(text: String) {
         lastInboundMs = System.currentTimeMillis()
-        buffer.append(text)
-        while (true) {
-            val newline = buffer.indexOf("\n")
-            if (newline < 0) break
-            val line = buffer.substring(0, newline).trim()
-            buffer.delete(0, newline + 1)
-            if (line.isEmpty()) continue
-            val json = try {
-                JSONObject(line)
-            } catch (_: Exception) {
-                continue
+        val frames = mutableListOf<JSONObject>()
+        synchronized(buffer) {
+            buffer.append(text)
+            val parts = buffer.split("\n")
+            buffer.setLength(0)
+            parts.forEachIndexed { index, raw ->
+                val line = raw.trim()
+                if (line.isEmpty()) return@forEachIndexed
+                val json = try {
+                    JSONObject(line)
+                } catch (_: Exception) {
+                    if (index == parts.lastIndex && buffer.length + line.length < 4_000_000) buffer.append(line)
+                    null
+                }
+                if (json != null) frames += json
             }
-            dispatch(json)
         }
+        frames.forEach { dispatch(it) }
     }
 
     private fun dispatch(json: JSONObject) {
@@ -365,6 +404,20 @@ class GatewayHttp(context: Context, private val tokens: TokenStore) {
     suspend fun delete(url: String): JSONObject = request("DELETE", url, null, true, slow)
 
     private suspend fun request(
+        method: String,
+        url: String,
+        body: JSONObject?,
+        auth: Boolean,
+        http: OkHttpClient,
+    ): JSONObject = try {
+        requestOnce(method, url, body, auth, http)
+    } catch (error: NetFailure) {
+        throw error
+    } catch (error: java.io.IOException) {
+        throw NetFailure(whereOf(url), error)
+    }
+
+    private suspend fun requestOnce(
         method: String,
         url: String,
         body: JSONObject?,
