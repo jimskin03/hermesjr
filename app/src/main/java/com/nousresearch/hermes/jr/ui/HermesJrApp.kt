@@ -333,16 +333,16 @@ private fun ChatsPane(state: UiState, model: HermesModel) {
         }
         item { Section("Bots") }
         if (state.profiles.isEmpty()) item { Text("No bots yet.", color = Muted, modifier = Modifier.padding(vertical = 8.dp)) }
-        items(state.profiles, key = { "b-" + it.name }) { bot ->
+        items(state.profiles.distinctBy { it.name }, key = { "b-" + it.name }) { bot ->
             RowButton(bot.name, bot.preview.ifBlank { bot.model }) { model.openBot(bot.name) }
         }
         item { Section("Rooms") }
         if (state.rooms.isEmpty()) item { Text("No group rooms yet.", color = Muted, modifier = Modifier.padding(vertical = 8.dp)) }
-        items(state.rooms, key = { "r-" + it.id }) { room ->
+        items(state.rooms.distinctBy { it.id }, key = { "r-" + it.id }) { room ->
             RowButton(room.name, "${room.members} bots") { model.openRoom(room.id) }
         }
         if (state.mirror.isNotEmpty()) item { Section("Desktop rooms, read only") }
-        items(state.mirror, key = { "m-" + it.id }) { room ->
+        items(state.mirror.distinctBy { it.id }, key = { "m-" + it.id }) { room ->
             RowButton(room.name, "Saved on the desktop") { model.openMirror(room) }
         }
     }
@@ -383,7 +383,7 @@ private fun BotsPane(state: UiState, model: HermesModel) {
                 Text("New bot")
             }
         }
-        items(state.profiles, key = { it.name }) { bot ->
+        items(state.profiles.distinctBy { it.name }, key = { it.name }) { bot ->
             Column(Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
                 Text(bot.name, color = Ink, fontWeight = FontWeight.SemiBold)
                 if (bot.model.isNotBlank()) Text(bot.model, color = Muted, fontSize = 13.sp)
@@ -480,12 +480,12 @@ private fun RoomPane(state: UiState, model: HermesModel) {
             TextButton(onClick = { disband = true }) { Text("Disband", color = Danger) }
         }
         LazyColumn(Modifier.weight(1f).padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(room.events, key = { it.key.ifBlank { "s${it.seq}-${it.who}" } }) { event ->
+            items(room.events.distinctBy { it.key.ifBlank { "s${it.seq}-${it.who}" } }, key = { it.key.ifBlank { "s${it.seq}-${it.who}" } }) { event ->
                 Text(event.who, color = Muted, fontSize = 12.sp)
                 Text(event.text, color = if (event.who == "you") Accent else Ink)
             }
             if (room.live.isNotBlank()) item { Text(room.live, color = Ink) }
-            items(room.pending, key = { it.requestId.ifBlank { it.taskId } }) { action ->
+            items(room.pending.distinctBy { it.requestId.ifBlank { it.taskId } }, key = { it.requestId.ifBlank { it.taskId } }) { action ->
                 PendingRow(action, model)
             }
         }
@@ -584,9 +584,9 @@ private fun McpPane(state: UiState, model: HermesModel) {
     val context = LocalContext.current
     LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         item { Text("MCP · ${mcp.profile}", color = Ink, fontWeight = FontWeight.SemiBold) }
-        items(mcp.servers, key = { it.name }) { server -> McpRow(server, model, context) { keyFor = it } }
+        items(mcp.servers.distinctBy { it.name }, key = { it.name }) { server -> McpRow(server, model, context) { keyFor = it } }
         item { Text("Catalog", color = Muted) }
-        items(mcp.catalog, key = { it.first }) { (preset, description) ->
+        items(mcp.catalog.distinctBy { it.first }, key = { it.first }) { (preset, description) ->
             Column {
                 Text(preset, color = Ink)
                 if (description.isNotBlank()) Text(description, color = Muted, fontSize = 13.sp)

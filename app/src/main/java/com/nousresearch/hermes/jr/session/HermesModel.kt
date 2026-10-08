@@ -2,6 +2,7 @@ package com.nousresearch.hermes.jr.session
 
 import android.app.Application
 import android.net.Uri
+import android.util.Log
 import android.util.Base64
 import androidx.browser.customtabs.CustomTabsIntent
 import androidx.lifecycle.AndroidViewModel
@@ -28,6 +29,7 @@ import java.net.URI
 import java.net.URLEncoder
 import java.util.ArrayDeque
 import java.util.UUID
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -99,6 +101,16 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state.asStateFlow()
 
+    /**
+     * Last line of defence: an unexpected exception in any model coroutine (a server payload with a
+     * shape this build does not expect, a bug) becomes a notice instead of killing the process.
+     */
+    private val safe = CoroutineExceptionHandler { _, error ->
+        JrLog.i("uncaught in model: ${error.javaClass.name}: ${error.message}")
+        Log.e("HermesJr", "uncaught in model coroutine", error)
+        _state.value = _state.value.copy(busy = false, notice = "Something went wrong: ${error.javaClass.simpleName}: ${error.message.orEmpty().take(200)}")
+    }
+
     private var base = ""
     private var signProvider: String? = null
     private var wantSocket = false
@@ -121,12 +133,12 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
     private var intentionalBridgeClose = false
 
     init {
-        rpc.onEvent = { frame -> viewModelScope.launch(Dispatchers.Main.immediate) { onFrame(frame) } }
+        rpc.onEvent = { frame -> viewModelScope.launch(safe + Dispatchers.Main.immediate) { onFrame(frame) } }
         rpc.onServerRequest = { id, method, params ->
-            viewModelScope.launch(Dispatchers.Main.immediate) { addCard(id, method, params); syncRelay() }
+            viewModelScope.launch(safe + Dispatchers.Main.immediate) { addCard(id, method, params); syncRelay() }
         }
         rpc.onClosed = {
-            viewModelScope.launch(Dispatchers.Main.immediate) {
+            viewModelScope.launch(safe + Dispatchers.Main.immediate) {
                 if (!wantSocket) return@launch
                 val why = rpc.lastError
                 if (why.isNotBlank()) JrLog.i("ws lost: $why")
@@ -144,9 +156,9 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
         }
         bridge.onActivity = { lastRfbMs = System.currentTimeMillis() }
         bridge.onUpstreamClose = { code ->
-            viewModelScope.launch(Dispatchers.Main.immediate) { onRfbClosed(code) }
+            viewModelScope.launch(safe + Dispatchers.Main.immediate) { onRfbClosed(code) }
         }
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             val saved = store.read()
             base = saved.baseUrl
             parseCursors(saved.cursors)
@@ -157,7 +169,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
 
     fun useHost(raw: String) {
         signJob?.cancel()
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             _state.value = _state.value.copy(busy = true, signingIn = false, notice = "")
             try {
                 var normalized = try {
@@ -240,7 +252,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
     fun signIn(context: android.content.Context) {
         if (base.isBlank()) return
         signJob?.cancel()
-        signJob = viewModelScope.launch {
+        signJob = viewModelScope.launch(safe) {
             _state.value = _state.value.copy(busy = true, notice = "")
             var stage = "Could not start sign-in"
             val server = try {
@@ -326,7 +338,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
         streaming.clear()
         cursors.clear()
         viewerId = ""
-        viewModelScope.launch { store.wipeSession() }
+        viewModelScope.launch(safe) { store.wipeSession() }
         stopRelay()
         _state.value = UiState(booting = false, baseUrl = base, notice = "Signed out on this phone.")
     }
@@ -357,7 +369,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun openBot(name: String) {
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             try {
                 val bot = _state.value.profiles.find { it.name == name }
                 val snap = if (bot != null && bot.sessionId.isNotBlank()) {
@@ -393,7 +405,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
         val chat = _state.value.chat ?: return
         val body = text.trim()
         if (body.isEmpty()) return
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             val next = chat.copy(lines = chat.lines + Line("user", body), streaming = true)
             _state.value = _state.value.copy(chat = next)
             streaming.add(chat.sessionId)
@@ -419,7 +431,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
 
     fun stopChat() {
         val chat = _state.value.chat ?: return
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             try {
                 rpc("session.interrupt", JSONObject().put("session_id", chat.sessionId).put("profile", chat.profile))
             } catch (error: Exception) {
@@ -436,7 +448,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
 
     fun attach(uri: Uri) {
         val chat = _state.value.chat ?: return
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             try {
                 val resolver = getApplication<Application>().contentResolver
                 val name = resolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
@@ -503,7 +515,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
             return
         }
         val line = soul.replace("\n", " ").trim().take(240)
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             try {
                 rpc(
                     "profiles.create",
@@ -522,7 +534,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
             note("The default bot stays on the computer.")
             return
         }
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             try {
                 val result = io { http.delete("$base/api/profiles/${enc(name)}") }
                 if (result.optBoolean("settlement_pending")) {
@@ -537,7 +549,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
 
     fun openRoom(id: String) {
         roomJob?.cancel()
-        roomJob = viewModelScope.launch {
+        roomJob = viewModelScope.launch(safe) {
             val row = _state.value.rooms.find { it.id == id }
             _state.value = _state.value.copy(
                 room = RoomView(id, row?.name ?: id, emptyList(), emptyList(), emptyList(), false, ""),
@@ -589,7 +601,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
         val room = _state.value.room ?: return
         val body = text.trim()
         if (body.isEmpty()) return
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             try {
                 rpc(
                     "groups.send",
@@ -624,7 +636,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
             note("This phone will not create an 11th room.")
             return
         }
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             try {
                 val members = JSONArray()
                 profiles.distinct().forEach { profile ->
@@ -642,7 +654,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
 
     fun renameRoom(name: String) {
         val room = _state.value.room ?: return
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             try {
                 rpc("groups.rename", JSONObject().put("room_id", room.id).put("event_id", ident()).put("name", name.trim().take(200)))
                 refreshRooms()
@@ -654,7 +666,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
 
     fun stopRoom() {
         val room = _state.value.room ?: return
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             try {
                 rpc("groups.stop", JSONObject().put("room_id", room.id).put("cancel_id", ident()))
             } catch (error: Exception) {
@@ -665,7 +677,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
 
     fun disbandRoom() {
         val room = _state.value.room ?: return
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             try {
                 rpc("groups.disband", JSONObject().put("room_id", room.id).put("cancel_id", ident()))
                 closeRoom()
@@ -693,7 +705,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
             note("A room needs 2 to 6 bots.")
             return
         }
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             try {
                 val members = JSONArray()
                 profiles.distinct().forEach { profile ->
@@ -722,7 +734,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
     fun approveRoom(action: PendingAction, choice: String) {
         val room = _state.value.room ?: return
         if (choice != "once" && choice != "deny") return
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             try {
                 rpc(
                     "groups.approve",
@@ -742,7 +754,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
 
     fun retryRoom(action: PendingAction) {
         val room = _state.value.room ?: return
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             try {
                 rpc("groups.retry", JSONObject().put("room_id", room.id).put("task_id", action.taskId))
             } catch (error: Exception) {
@@ -752,7 +764,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun openMcp(profile: String) {
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             _state.value = _state.value.copy(mcp = McpView(profile, emptyList(), emptyList()))
             reloadMcp(profile)
         }
@@ -760,7 +772,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
 
     fun addMcp(name: String, preset: String?, command: String, args: String, url: String) {
         val mcp = _state.value.mcp ?: return
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             try {
                 val params = JSONObject().put("name", name.trim()).put("profile", mcp.profile)
                 if (!preset.isNullOrBlank()) params.put("preset", preset)
@@ -783,7 +795,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
 
     fun removeMcp(name: String) {
         val mcp = _state.value.mcp ?: return
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             try {
                 rpc("mcp.servers.remove", JSONObject().put("name", name).put("profile", mcp.profile))
                 reloadMcp(mcp.profile)
@@ -795,7 +807,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
 
     fun testMcp(name: String) {
         val mcp = _state.value.mcp ?: return
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             try {
                 val result = rpc("mcp.servers.test", JSONObject().put("name", name).put("profile", mcp.profile), 60_000)
                 note(
@@ -814,7 +826,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
 
     fun setMcpKey(name: String, value: String, env: String) {
         val mcp = _state.value.mcp ?: return
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             try {
                 val params = JSONObject().put("name", name).put("profile", mcp.profile).put("value", value)
                 if (env.isNotBlank()) params.put("env_var", env.trim())
@@ -828,7 +840,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
 
     fun setMcpEnabled(name: String, enabled: Boolean) {
         val mcp = _state.value.mcp ?: return
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             try {
                 io {
                     http.put(
@@ -847,7 +859,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
 
     fun startOauth(name: String, context: android.content.Context) {
         val mcp = _state.value.mcp ?: return
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             try {
                 val started = rpc("mcp.servers.oauth.start", JSONObject().put("name", name).put("profile", mcp.profile))
                 val url = started.optString("auth_url")
@@ -855,13 +867,13 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
                     CustomTabsIntent.Builder().build().launchUrl(context, Uri.parse(url))
                 }
                 val flow = started.optString("session_id")
-                repeat(20) {
+                for (attempt in 0 until 20) {
                     delay(2_000)
                     val poll = rpc(
                         "mcp.servers.oauth.poll",
                         JSONObject().put("name", name).put("profile", mcp.profile).put("session_id", flow),
                     )
-                    if (poll.optString("status") != "pending") return@repeat
+                    if (poll.optString("status") != "pending") break
                 }
                 reloadMcp(mcp.profile)
             } catch (error: Exception) {
@@ -882,20 +894,20 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
         screenWanted = true
         screenMetered = metered
         screenJob?.cancel()
-        screenJob = viewModelScope.launch { runScreen(profile, metered) }
+        screenJob = viewModelScope.launch(safe) { runScreen(profile, metered) }
     }
 
     fun hideScreen() {
         screenWanted = false
         screenJob?.cancel()
         thumbJob?.cancel()
-        viewModelScope.launch { releaseLeaseAndBridge() }
+        viewModelScope.launch(safe) { releaseLeaseAndBridge() }
     }
 
     fun takeOver() {
         val screen = _state.value.screen
         if (viewerId.isBlank()) return
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             try {
                 val result = rpc(
                     "display.lease.acquire",
@@ -911,12 +923,12 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun handBack() {
-        viewModelScope.launch { releaseLease() }
+        viewModelScope.launch(safe) { releaseLease() }
     }
 
     fun startDesktop() {
         val profile = _state.value.screen.profile
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             try {
                 rpc("display.start", JSONObject().put("profile", profile), 120_000)
                 if (screenWanted) runScreen(profile, screenMetered)
@@ -927,7 +939,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun installDesktop() {
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             try {
                 rpc("display.install", JSONObject().put("profile", _state.value.screen.profile), 30_000)
                 note("Install started on the computer.")
@@ -938,7 +950,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun grantComputerUse() {
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             try {
                 io { http.post("$base/api/tools/computer-use/permissions/grant", JSONObject()) }
                 note("Asked the computer to open its permission prompt.")
@@ -968,7 +980,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
             if (epoch != socketEpoch) return
             rpc.connect(base, ticket)
             _state.value = _state.value.copy(busy = false)
-            viewModelScope.launch {
+            viewModelScope.launch(safe) {
                 delay(20_000)
                 if (epoch == socketEpoch && wantSocket && readyEpoch != epoch && !_state.value.ready) {
                     val detail = if (rpc.opened) {
@@ -1038,14 +1050,25 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
         if (epoch != socketEpoch) return
         rpc.noteCapabilities(declines)
         _state.value = _state.value.copy(ready = true, offline = false, busy = false)
-        refreshProfiles()
-        refreshRooms()
-        loadCapabilities()
+        listOf<Pair<String, suspend () -> Unit>>(
+            "bots" to { refreshProfiles() },
+            "rooms" to { refreshRooms() },
+            "room capabilities" to { loadCapabilities() },
+        ).forEach { (what, load) ->
+            try {
+                load()
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                JrLog.i("load $what failed: ${error.javaClass.simpleName}")
+                note("Could not load $what: ${error.jr()}")
+            }
+        }
         val chat = _state.value.chat
         if (chat != null) openBot(chat.profile)
         if (heartbeat) {
             pingJob?.cancel()
-            pingJob = viewModelScope.launch {
+            pingJob = viewModelScope.launch(safe) {
                 while (isActive && socketEpoch == epoch) {
                     delay(15_000)
                     if (System.currentTimeMillis() - rpc.lastInboundMs > 45_000) {
@@ -1075,22 +1098,31 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
                 preview = canon?.optString("preview").orEmpty(),
             )
         }
-        val mirror = listed.optJSONArray("profiles")?.objects().orEmpty().flatMap { mirrorOf(it) }
-            .filter { room -> _state.value.rooms.none { it.id == room.id } }
-        _state.value = _state.value.copy(profiles = bots, mirror = mirror)
+        val mirror = listed.optJSONArray("profiles")?.objects().orEmpty()
+            .flatMap { row -> try { mirrorOf(row) } catch (_: Exception) { emptyList() } }
+            .filter { room -> room.id.isNotBlank() && _state.value.rooms.none { it.id == room.id } }
+            .distinctBy { it.id }
+        _state.value = _state.value.copy(profiles = bots.filter { it.name.isNotBlank() }.distinctBy { it.name }, mirror = mirror)
     }
 
     private suspend fun refreshRooms() {
+        // Before this fix `return@repeat` only skipped to the next of 20 iterations, so the same page
+        // was fetched 20 times and every room was listed 20 times. The duplicate "r-<id>" LazyColumn
+        // keys then crashed Compose on every start once one room existed (#2).
         val all = mutableListOf<JSONObject>()
         var offset = 0
-        repeat(20) {
+        for (pageNo in 0 until 20) {
             val page = rpc("groups.list", JSONObject().put("limit", 500).put("offset", offset))
-            val rooms = page.optJSONArray("rooms")?.objects().orEmpty()
-            all += rooms
-            if (page.isNull("next_offset")) return@repeat
-            offset = page.optInt("next_offset")
+            all += page.optJSONArray("rooms")?.objects().orEmpty()
+            if (!page.has("next_offset") || page.isNull("next_offset")) break
+            val next = page.optInt("next_offset", -1)
+            if (next <= offset) break
+            offset = next
         }
-        val rows = all.map { RoomRow(it.optString("room_id"), it.optString("name"), it.optJSONArray("members")?.length() ?: 0) }
+        val rows = all.mapNotNull { row ->
+            val id = row.optString("room_id").ifBlank { row.optString("id") }
+            if (id.isBlank()) null else RoomRow(id, row.optString("name").ifBlank { id }, row.optJSONArray("members")?.length() ?: 0)
+        }.distinctBy { it.id }
         _state.value = _state.value.copy(
             rooms = rows,
             mirror = _state.value.mirror.filter { mirror -> rows.none { it.id == mirror.id } },
@@ -1194,7 +1226,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun watchStall(profile: String) {
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             val epoch = socketEpoch
             while (isActive && screenWanted && socketEpoch == epoch && _state.value.screen.pageUrl.isNotBlank()) {
                 delay(5_000)
@@ -1213,7 +1245,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
 
     private fun watchThumbnails(profile: String) {
         thumbJob?.cancel()
-        thumbJob = viewModelScope.launch {
+        thumbJob = viewModelScope.launch(safe) {
             val epoch = socketEpoch
             while (isActive && screenWanted && socketEpoch == epoch) {
                 val screen = _state.value.screen
@@ -1256,7 +1288,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
             return
         }
         rfbCloses.addLast(now)
-        viewModelScope.launch {
+        viewModelScope.launch(safe) {
             try {
                 val screen = attachRfb(_state.value.screen.profile, _state.value.screen, passViewer = true)
                 _state.value = _state.value.copy(screen = screen)
@@ -1327,7 +1359,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
             val lines = if (draft.isNotBlank() && type != "message.complete") chat.lines + Line("assistant", draft) else chat.lines
             _state.value = _state.value.copy(chat = chat.copy(lines = lines, draft = "", streaming = false))
             if (type == "message.complete") {
-                viewModelScope.launch {
+                viewModelScope.launch(safe) {
                     try {
                         val history = rpc("session.history", JSONObject().put("session_id", sid).put("profile", chat.profile))
                         val current = _state.value.chat
@@ -1451,7 +1483,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
             }
         }.toString()
         val cursorJson = JSONObject().apply { cursors.forEach { (id, seq) -> put(id, seq) } }.toString()
-        viewModelScope.launch { store.saveCaches(cursorJson, transcript, rooms) }
+        viewModelScope.launch(safe) { store.saveCaches(cursorJson, transcript, rooms) }
     }
 
     private fun parseCursors(raw: String) {
