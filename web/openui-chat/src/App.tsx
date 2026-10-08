@@ -233,8 +233,8 @@ export function App() {
             <input type="checkbox" checked={richUi} onChange={(e) => setRichUi(e.target.checked)} />
             Rich UI
           </label>
-          {snap.kind === "room" && !snap.richUiDefault && (
-            <span className="muted">Off by default in rooms (other clients would see the prompt).</span>
+          {snap.kind === "room" && (
+            <span className="rich-note">Off by default here: others in the room see the prompt.</span>
           )}
         </div>
       </footer>

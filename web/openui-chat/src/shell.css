@@ -75,8 +75,10 @@
 .composer .send { background: var(--accent); color: #0d1117; }
 .composer .send:disabled { opacity: 0.4; }
 .composer .stop { background: var(--elevated); color: var(--accent); border: 1px solid var(--stroke); }
-.composer-meta { display: flex; align-items: center; gap: 10px; margin-top: 6px; font-size: 12px; }
-.rich { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); user-select: none; }
+.composer-meta { display: flex; align-items: center; gap: 10px; margin-top: 6px; font-size: 12px; min-width: 0; }
+.rich { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); user-select: none; flex-shrink: 0; white-space: nowrap; }
+.rich input { margin: 0; }
+.rich-note { color: var(--muted); font-size: 11px; line-height: 1.3; min-width: 0; flex: 1; opacity: 0.85; }
 .rich.on { color: var(--accent); }
 .rich input { accent-color: var(--accent); }
 .muted { color: var(--muted); }
@@ -92,5 +94,29 @@
 .md blockquote {
   margin: 0.4em 0; padding-left: 10px; border-left: 3px solid var(--stroke); color: var(--muted);
 }
-.openui-root { color: var(--ink); }
+/* OpenUI cards inside a bot bubble: same surface as the bubble, theme tokens do the rest. */
+.openui-root { color: var(--openui-text-neutral-primary, var(--ink)); min-width: 0; }
+.openui-root .openui-card { background: transparent; border-color: transparent; box-shadow: none; padding-left: 0; padding-right: 0; gap: 12px; }
+.bubble.bot:has(.openui-root) { padding: 12px 14px; }
+.openui-root .openui-table-container { background: var(--bg); }
+.openui-root .openui-table-head { background: rgba(255,255,255,0.03); }
+.openui-root .openui-table-head .openui-table-head-label { color: var(--muted); font-weight: 600; }
+/* Follow-ups as tappable amber chips instead of plain list rows. */
+.openui-root .openui-follow-up-block { gap: 0; }
+.openui-root .openui-follow-up-block__header {
+  border-bottom: none; padding: 0 0 6px; margin: 0; font-size: 12px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+.openui-root .openui-follow-up-block { flex-direction: row; flex-wrap: wrap; gap: 8px; }
+.openui-root .openui-follow-up-block__header { flex-basis: 100%; }
+.openui-root .openui-follow-up-item {
+  width: auto; max-width: 100%; display: inline-flex; gap: 6px;
+  padding: 8px 14px; border: 1px solid rgba(192,133,50,0.55); border-radius: 999px;
+  background-color: rgba(192,133,50,0.14); color: #e0a95f;
+  font-size: 14px; line-height: 1.3; min-height: 36px;
+}
+.openui-root .openui-follow-up-item:last-child { border-bottom: 1px solid rgba(192,133,50,0.55); }
+.openui-root .openui-follow-up-item:active { background-color: rgba(192,133,50,0.3); }
+.openui-root .openui-follow-up-item-text { color: #e0a95f; flex: 0 1 auto; }
+.openui-root .openui-follow-up-item svg { color: #e0a95f; flex-shrink: 0; }
 .openui-root img { max-width: 100%; height: auto; border-radius: 8px; }
