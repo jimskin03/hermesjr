@@ -131,6 +131,12 @@ The debug APK is `app/build/outputs/apk/debug/app-debug.apk`. Install it with `a
 
 Release builds minify and shrink resources.
 
+## Nightly APK
+
+`.github/workflows/nightly.yml` builds the debug APK on every push to `main`, twice a day when `main` changed in the last 24 hours, and on manual runs (`gh workflow run nightly.yml`). It replaces `hermesjr-nightly.apk` on the [`nightly` prerelease](https://github.com/jimskin03/hermesjr/releases/tag/nightly). The release notes name the commit.
+
+The APK is signed with the debug keystore in the `DEBUG_KEYSTORE_BASE64` repo secret, the same key as the earlier test APKs, so it installs over them. The build fails if the secret is missing or the signing certificate changes.
+
 ## Layout
 
 Kotlin and Jetpack Compose. AGP 9.4.1, Kotlin 2.4.10, Compose BOM 2026.09.00. Chat and rooms render in a WebView (see [OpenUI chat](#openui-chat)); auth, RPC, Screen, and settings stay native. The gateway speaks JSON-RPC over a ticketed WebSocket. The screen picture is drawn by the noVNC that the computer serves (see Screen viewer); no noVNC code ships in the APK. This repository is MIT; see `LICENSE`. `host/` holds the viewer script and systemd unit. `web/openui-chat/` holds the chat UI source.

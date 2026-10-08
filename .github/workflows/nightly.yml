@@ -1,0 +1,134 @@
+name: Nightly APK
+
+on:
+  # Daily at 09:00 and 18:00 UTC (17:00 and 02:00 MYT), like Friendly. Skipped when nothing changed.
+  schedule:
+    - cron: '0 9,18 * * *'
+  # Every push to main (a scheduled run can be skipped by GitHub under load).
+  push:
+    branches: [main]
+  # Manual run.
+  workflow_dispatch:
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false   # never interrupt a run between clearing and uploading assets
+
+jobs:
+  # A scheduled run only builds when main has a commit from the last 24 hours.
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for recent commits
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "$(git log --since='24 hours ago' --oneline)" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "No commits in the last 24 hours, skipping the build"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # publish the release
+    env:
+      # SHA-256 of the signing certificate Greg's installed APKs carry (the build box's debug key).
+      # Public fingerprint, not a secret: the build fails rather than publish an APK that would not
+      # install over the current app.
+      EXPECTED_CERT_SHA256: c165772b6d08f3427ebd6d3dd01d2ebce605722099f274071f31ada56ff0f7ec
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Gradle cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+
+      # ubuntu-latest has no Android SDK; AGP needs platform 37 (compileSdk) and build-tools.
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'tools platform-tools platforms;android-37 build-tools;35.0.0'
+
+      # The debug build signs with ~/.android/debug.keystore. Use the same key as the APKs Greg
+      # already has installed, so the nightly updates in place (no uninstall, no lost sign-in).
+      - name: Install signing key
+        env:
+          DEBUG_KEYSTORE_BASE64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$DEBUG_KEYSTORE_BASE64" ]; then
+            echo "::error::DEBUG_KEYSTORE_BASE64 secret is not set; refusing to sign with a throwaway key."
+            exit 1
+          fi
+          mkdir -p ~/.android
+          printf '%s' "$DEBUG_KEYSTORE_BASE64" | base64 -d > ~/.android/debug.keystore
+
+      # The OpenUI web bundle is committed under app/src/main/assets/openui, so no Node step.
+      - name: Build debug APK
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleDebug --console=plain --no-daemon
+
+      - name: Verify signature and name the asset
+        id: apk
+        run: |
+          set -euo pipefail
+          apksigner=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)apksigner
+          src=app/build/outputs/apk/debug/app-debug.apk
+          got=$("$apksigner" verify --print-certs "$src" | sed -n 's/.*SHA-256 digest: //p' | head -1)
+          if [ "$got" != "$EXPECTED_CERT_SHA256" ]; then
+            echo "::error::APK signed with $got, expected $EXPECTED_CERT_SHA256"
+            exit 1
+          fi
+          mkdir -p out
+          cp "$src" out/hermesjr-nightly.apk
+          echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "built=$(date -u '+%Y-%m-%d %H:%M UTC')" >> "$GITHUB_OUTPUT"
+          echo "subject=$(git log -1 --format=%s | tr -d '\`')" >> "$GITHUB_OUTPUT"
+          ls -la out
+
+      # Drop every asset on the fixed nightly tag first; softprops only overwrites same-named files.
+      - name: Clear previous nightly assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ids=$(gh api "repos/${{ github.repository }}/releases/tags/nightly" --jq '.assets[].id' 2>/dev/null || true)
+          for id in ${ids}; do
+            echo "Deleting release asset id=${id}"
+            gh api -X DELETE "repos/${{ github.repository }}/releases/assets/${id}"
+          done
+
+      - name: Publish nightly prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: Nightly Build
+          prerelease: true
+          make_latest: false
+          body: |
+            Automatic build of `main` at commit [`${{ steps.apk.outputs.short }}`](https://github.com/${{ github.repository }}/commit/${{ github.sha }}) (${{ github.sha }}): ${{ steps.apk.outputs.subject }}
+            Built ${{ steps.apk.outputs.built }}.
+
+            Install `hermesjr-nightly.apk`. It is a debug build signed with the same key as the earlier test APKs, so it installs over the current app.
+
+            > Development build. It may be unstable and is for testing only.
+          files: out/hermesjr-nightly.apk
