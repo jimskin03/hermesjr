@@ -142,6 +142,10 @@ data class UiState(
     val screen: ScreenState = ScreenState(),
     /** The saved noVNC viewer address as typed (blank = gateway host, port [DEFAULT_NOVNC_PORT]). */
     val novncUrl: String = "",
+    /** Prefer the OpenUI WebView for chat/rooms (native remains available via More). */
+    val openUiChat: Boolean = true,
+    /** Default Rich UI toggle for 1:1 chats. Rooms always start with Rich UI off. */
+    val openUiRichDefault: Boolean = false,
 )
 
 class HermesModel(app: Application) : AndroidViewModel(app) {
@@ -189,6 +193,10 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
     private var relayWaiting: Boolean? = null
     private var intentionalBridgeClose = false
     private var novncSetting = ""
+    private var openUiChat = true
+    private var openUiRichDefault = false
+    /** Cached <ui-format> body from assets/openui/ui-format.txt (no tags). */
+    private var uiFormatBody: String? = null
 
     init {
         rpc.onEvent = { frame -> viewModelScope.launch(safe + Dispatchers.Main.immediate) { onFrame(frame) } }
@@ -220,13 +228,21 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
             val saved = store.read()
             base = saved.baseUrl
             novncSetting = saved.novncUrl
+            openUiChat = saved.openUiChat
+            openUiRichDefault = saved.openUiRichDefault
             parseCursors(saved.cursors)
             try {
                 val json = JSONObject(saved.roomRounds)
                 json.keys().forEach { key -> roomRounds[key] = json.optInt(key, DEFAULT_BOT_ROUNDS).coerceIn(1, 10) }
             } catch (_: Exception) {
             }
-            _state.value = _state.value.copy(baseUrl = saved.baseUrl, novncUrl = saved.novncUrl, booting = false)
+            _state.value = _state.value.copy(
+                baseUrl = saved.baseUrl,
+                novncUrl = saved.novncUrl,
+                openUiChat = saved.openUiChat,
+                openUiRichDefault = saved.openUiRichDefault,
+                booting = false,
+            )
             if (saved.baseUrl.isNotBlank() && tokens.read() != null) useHost(saved.baseUrl)
         }
     }
@@ -404,7 +420,14 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
         viewerId = ""
         viewModelScope.launch(safe) { store.wipeSession() }
         stopRelay()
-        _state.value = UiState(booting = false, baseUrl = base, novncUrl = novncSetting, notice = "Signed out on this phone.")
+        _state.value = UiState(
+            booting = false,
+            baseUrl = base,
+            novncUrl = novncSetting,
+            openUiChat = openUiChat,
+            openUiRichDefault = openUiRichDefault,
+            notice = "Signed out on this phone.",
+        )
     }
 
     fun dismissNotice() {
@@ -465,11 +488,13 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun sendChat(text: String) {
+    fun sendChat(text: String, richUi: Boolean = false) {
         val chat = _state.value.chat ?: return
         val body = text.trim()
         if (body.isEmpty()) return
+        val outbound = if (richUi) withUiFormat(body) else body
         viewModelScope.launch(safe) {
+            // Transcript keeps the user-visible text only; the prompt block rides only on the RPC.
             val next = chat.copy(lines = chat.lines + Line("user", body), streaming = true)
             _state.value = _state.value.copy(chat = next)
             streaming.add(chat.sessionId)
@@ -477,10 +502,10 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
             try {
                 val result = rpc(
                     "prompt.submit",
-                    JSONObject().put("session_id", chat.sessionId).put("profile", chat.profile).put("text", body),
+                    JSONObject().put("session_id", chat.sessionId).put("profile", chat.profile).put("text", outbound),
                     60_000,
                 )
-                JrLog.i("rpc prompt.submit ${result.optString("status")}")
+                JrLog.i("rpc prompt.submit ${result.optString("status")} richUi=$richUi")
             } catch (error: Exception) {
                 streaming.remove(chat.sessionId)
                 val current = _state.value.chat
@@ -702,13 +727,13 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun sendRoom(text: String) {
+    fun sendRoom(text: String, richUi: Boolean = false) {
         val room = _state.value.room ?: return
         val body = text.trim()
         if (body.isEmpty()) return
-        // The local echo carries the event_id sent to the server, and the server's message.user
-        // event comes back with that same id, so mergeEvent replaces the echo instead of adding a
-        // second copy (the duplicate "you" lines in #2's follow-up).
+        // Local echo shows the user text only. When Rich UI is on, the prompt block is attached to
+        // the outbound payload (other clients in the room will see it — hence off by default).
+        val outbound = if (richUi) withUiFormat(body) else body
         chainHalted -= room.id
         val eventId = ident()
         val echo = RoomEvent(
@@ -730,7 +755,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
                     "groups.send",
                     JSONObject().put("room_id", room.id).put("event_id", eventId).put(
                         "payload",
-                        JSONObject().put("text", body).put("thread_id", "main"),
+                        JSONObject().put("text", outbound).put("thread_id", "main"),
                     ),
                 )
             } catch (error: kotlinx.coroutines.CancellationException) {
@@ -1124,6 +1149,46 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
      * Saves where the computer serves noVNC. Accepts blank (default), a port, host:port, or a URL;
      * a pasted `.../vnc.html` is trimmed to its folder.
      */
+
+    fun setOpenUiChat(enabled: Boolean) {
+        openUiChat = enabled
+        _state.value = _state.value.copy(openUiChat = enabled)
+        viewModelScope.launch(safe) { store.saveOpenUiChat(enabled) }
+    }
+
+    fun setOpenUiRichDefault(enabled: Boolean) {
+        openUiRichDefault = enabled
+        _state.value = _state.value.copy(openUiRichDefault = enabled)
+        viewModelScope.launch(safe) { store.saveOpenUiRichDefault(enabled) }
+    }
+
+    /**
+     * OpenUI form/button actions become a new user message describing the action (rendering
+     * rule 3). Nothing runs silently: the page can only ask to post text the user can see.
+     */
+    fun handleOpenUiAction(payload: JSONObject) {
+        if (payload.optString("type") != "message") return
+        val text = payload.optString("text").trim().take(2_000)
+        if (text.isEmpty()) return
+        when {
+            _state.value.chat != null -> sendChat(text, richUi = false)
+            _state.value.room != null -> sendRoom(text, richUi = false)
+        }
+    }
+
+    private fun withUiFormat(userText: String): String {
+        val body = uiFormatBody ?: loadUiFormatBody().also { uiFormatBody = it }
+        if (body.isBlank()) return userText
+        return userText.trimEnd() + "\n\n<ui-format>\n" + body.trim() + "\n</ui-format>"
+    }
+
+    private fun loadUiFormatBody(): String = try {
+        getApplication<Application>().assets.open("openui/ui-format.txt").bufferedReader().use { it.readText() }
+    } catch (error: Exception) {
+        JrLog.i("ui-format missing: ${error.javaClass.simpleName}")
+        ""
+    }
+
     fun setNovncUrl(raw: String) {
         val trimmed = raw.trim()
         if (trimmed.isNotBlank()) {
@@ -1852,12 +1917,22 @@ private fun strings(array: JSONArray?): List<String> {
 
 private fun JSONArray.join(sep: String): String = (0 until length()).joinToString(sep) { optString(it) }
 
+/**
+ * Hides the client-attached Rich UI prompt block (`<ui-format>…</ui-format>`) when the server
+ * echoes a user message back in history or room events. Display only; the server keeps it.
+ */
+internal fun stripUiFormat(text: String): String {
+    val start = text.indexOf("<ui-format>")
+    return if (start < 0) text else text.substring(0, start).trimEnd()
+}
+
 private fun linesFrom(array: JSONArray?): List<Line> {
     if (array == null) return emptyList()
     return array.objects().mapNotNull { row ->
         val role = row.optString("role").ifBlank { row.optString("display_kind") }
         val text = row.optString("text").ifBlank { row.optString("content") }
-        if (text.isBlank()) null else Line(role.ifBlank { "note" }, text.take(8_000))
+        val shown = if (role == "user") stripUiFormat(text) else text
+        if (shown.isBlank()) null else Line(role.ifBlank { "note" }, shown.take(8_000))
     }
 }
 
@@ -1913,7 +1988,7 @@ private fun eventLine(event: JSONObject, members: List<Member>): RoomEvent? {
     fun notice(text: String) = RoomEvent(seq, "", text.take(400), key = "e-$eventId", role = "notice", eventId = eventId, at = at)
     return when (kind) {
         "message.user" -> {
-            val text = payload.optString("text")
+            val text = stripUiFormat(payload.optString("text"))
             if (text.startsWith(FOLLOW_UP_MARK)) {
                 notice("Auto follow-up · " + text.removePrefix(FOLLOW_UP_MARK).substringBefore(":").take(160))
             } else if (text.isBlank()) null else RoomEvent(seq, "you", text.take(8_000), key = "e-$eventId", role = "user", eventId = eventId, at = at)

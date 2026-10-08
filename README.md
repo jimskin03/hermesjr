@@ -11,7 +11,7 @@ Four tabs:
 - **Chats.** Talk to one bot, or to a group room on the computer. Attach a file from the phone. Desktop group rooms that are only saved locally are shown read-only.
 - **Bots.** Create and delete bots on the computer. Open MCP servers from a bot row: list, add, remove, enable, and test.
 - **Screen.** Watch the computer's desktop. On Linux this is the Bot Desktop, drawn by the noVNC viewer that your computer serves (see [Screen viewer](#screen-viewer)). Take over is a separate button. Without the viewer, the tab shows a refreshing screenshot and says what to install. On other systems, screenshots still show up in the bot chat.
-- **More.** The saved computer address, the Screen viewer address, sign-out, and the setup notes below.
+- **More.** The saved computer address, the Screen viewer address, Chat UI (OpenUI / Native), Rich UI default, sign-out, and the setup notes below.
 
 While a bot is working, or the computer is waiting on you, a foreground notice stays up. Approval, sudo, secret, clarify, and vault prompts are cards. A swipe does not approve them.
 
@@ -97,6 +97,24 @@ The app refuses a few addresses before it will talk:
 
 Sign-in uses the system browser and a loopback redirect on the phone. After you sign in, the browser page sends you back to Hermes Jr.; if your browser blocks that, tap Open Hermes Jr. on the page. Use `http://` for a plain `hermes serve`; if you type `https://` and the computer only answers over HTTP on a private or Tailscale address, the app switches to `http://` and says so. Tokens stay in the Android Keystore. Sign out on the phone deletes those tokens only. There is no remote sign-out for one Jr. device. If the phone is lost and the computer uses a password, replace `HERMES_DASHBOARD_BASIC_AUTH_SECRET` and restart the supervised gateway. That ends every password session for the install, including the desktop. A password change alone does not.
 
+## OpenUI chat
+
+1:1 chats and rooms render in a WebView that loads only the bundled assets under `app/src/main/assets/openui/` (via `WebViewAssetLoader`). A restrictive CSP blocks network fetches from the page. Kotlin stays the source of truth: it pushes full chat snapshots over a small JS bridge (`HermesJrHost` / `HermesJrChat`) and handles send, stop, and form/button actions.
+
+**Rich UI.** When the composer checkbox is on, the phone appends a compact OpenUI instruction block (`<ui-format>…</ui-format>`, about 540 tokens) to the outgoing text. The bot can then reply in openui-lang (cards, tables, forms). The phone strips that block from what you see in history. Rooms keep Rich UI **off by default**, because other clients (desktop) would otherwise see the prompt text. **More → Rich UI default** sets the 1:1 default.
+
+**OpenUI / Native.** **More → Chat UI** switches between the WebView chat and the older Compose screens so you can compare them. The native screens will go away after Phase 4.
+
+**Rebuild the web bundle** (optional; the built files are already committed, so installing the APK does not need Node):
+
+```bash
+cd web/openui-chat
+npm ci
+npm run build
+```
+
+That regenerates `app/src/main/assets/openui/` (split JS/CSS + `ui-format.txt` + `BUILD.txt`) from `@openuidev/react-ui` / `@openuidev/react-lang`. Source is under `web/openui-chat/`.
+
 ## Build
 
 JDK 17 and an Android SDK. From this directory:
@@ -115,4 +133,4 @@ Release builds minify and shrink resources.
 
 ## Layout
 
-Kotlin and Jetpack Compose. AGP 9.4.1, Kotlin 2.4.10, Compose BOM 2026.09.00. The gateway speaks JSON-RPC over a ticketed WebSocket. The screen picture is drawn by the noVNC that the computer serves (see Screen viewer); no noVNC code ships in the APK. This repository is MIT; see `LICENSE`. `host/` holds the viewer script and systemd unit.
+Kotlin and Jetpack Compose. AGP 9.4.1, Kotlin 2.4.10, Compose BOM 2026.09.00. Chat and rooms render in a WebView (see [OpenUI chat](#openui-chat)); auth, RPC, Screen, and settings stay native. The gateway speaks JSON-RPC over a ticketed WebSocket. The screen picture is drawn by the noVNC that the computer serves (see Screen viewer); no noVNC code ships in the APK. This repository is MIT; see `LICENSE`. `host/` holds the viewer script and systemd unit. `web/openui-chat/` holds the chat UI source.

@@ -161,7 +161,9 @@ fun HermesJrApp(model: HermesModel = viewModel()) {
             if (state.notice.isNotBlank()) Banner(state.notice, onDismiss = model::dismissNotice)
             Box(Modifier.weight(1f)) {
                 when {
+                    state.chat != null && state.openUiChat -> OpenUiChatPane(state, model)
                     state.chat != null -> ChatPane(state, model)
+                    state.room != null && state.openUiChat -> OpenUiRoomPane(state, model)
                     state.room != null -> RoomPane(state, model)
                     state.mirrorOpen != null -> MirrorPane(state)
                     state.mcp != null -> McpPane(state, model)
@@ -874,10 +876,45 @@ private fun MorePane(state: UiState, model: HermesModel) {
         }
         TextButton(onClick = model::signOut) { Text("Sign out", color = Danger) }
         ScreenViewerSetting(state, model)
+        OpenUiSettings(state, model)
         Text("Keep the computer's gateway up", color = Ink, fontWeight = FontWeight.SemiBold)
         GatewaySetup()
         Text("Lost phone", color = Ink, fontWeight = FontWeight.SemiBold)
         Text(SetupCopy.LOST_PHONE, color = Muted, fontSize = 13.sp)
+    }
+}
+
+/** OpenUI chat (phases 0–3). Native chat stays available until Phase 4 cutover. */
+@Composable
+private fun OpenUiSettings(state: UiState, model: HermesModel) {
+    Text("Chat UI", color = Ink, fontWeight = FontWeight.SemiBold)
+    Text(
+        "OpenUI renders chats in a WebView (bundled assets only). Turn it off to use the native Compose chat for comparison.",
+        color = Muted,
+        fontSize = 13.sp,
+    )
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        TextButton(onClick = { model.setOpenUiChat(true) }) {
+            Text(if (state.openUiChat) "● OpenUI" else "OpenUI", color = if (state.openUiChat) Accent else Muted)
+        }
+        TextButton(onClick = { model.setOpenUiChat(false) }) {
+            Text(if (!state.openUiChat) "● Native" else "Native", color = if (!state.openUiChat) Accent else Muted)
+        }
+    }
+    if (state.openUiChat) {
+        Text(
+            "Rich UI attaches an OpenUI format hint to your message so the bot can reply with cards/tables. Off by default in rooms.",
+            color = Muted,
+            fontSize = 13.sp,
+        )
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = { model.setOpenUiRichDefault(true) }) {
+                Text(if (state.openUiRichDefault) "● Rich UI default on" else "Rich UI default on", color = if (state.openUiRichDefault) Accent else Muted)
+            }
+            TextButton(onClick = { model.setOpenUiRichDefault(false) }) {
+                Text(if (!state.openUiRichDefault) "● Off" else "Off", color = if (!state.openUiRichDefault) Accent else Muted)
+            }
+        }
     }
 }
 
@@ -1020,7 +1057,7 @@ private fun RowButton(title: String, subtitle: String, onClick: () -> Unit) {
 }
 
 @Composable
-private fun fieldColors() = OutlinedTextFieldDefaults.colors(
+internal fun fieldColors() = OutlinedTextFieldDefaults.colors(
     focusedTextColor = Ink,
     unfocusedTextColor = Ink,
     focusedBorderColor = Accent,
@@ -1072,7 +1109,7 @@ private fun AutoScroll(list: LazyListState, count: Int, growth: Int) {
  * when one bot @mentions another that never answered. Stop ends the chain.
  */
 @Composable
-private fun RoundsStepper(value: Int, onChange: (Int) -> Unit) {
+internal fun RoundsStepper(value: Int, onChange: (Int) -> Unit) {
     Column(Modifier.padding(top = 8.dp)) {
         Text("Max bot rounds per message", color = Ink, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
         Row(verticalAlignment = Alignment.CenterVertically) {

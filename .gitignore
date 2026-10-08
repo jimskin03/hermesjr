@@ -6,3 +6,8 @@ local.properties
 captures/
 .cxx/
 .externalNativeBuild/
+
+# OpenUI chat web (rebuild with npm; built assets live under app/src/main/assets/openui)
+web/openui-chat/node_modules/
+web/openui-chat/dist/
+web/openui-chat/dist-prompt/

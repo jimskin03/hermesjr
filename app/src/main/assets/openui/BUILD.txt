@@ -1,0 +1,8 @@
+Hermes Jr OpenUI chat bundle (generated; do not edit by hand)
+source: web/openui-chat  (@openuidev/react-ui 0.17.0, @openuidev/react-lang 0.3.2)
+rebuild: cd web/openui-chat && npm ci && npm run build
+
+index.html  700  sha256:3cdd32b42ab027b7
+static/app-D6K933-S.js  3319542  sha256:4d8bb5f916a44842
+static/style-BgxCBQsI.css  299096  sha256:990a75e941b4ec35
+ui-format.txt  2168  sha256:1d6415d64c924c39

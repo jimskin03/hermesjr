@@ -52,6 +52,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.11.0")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.11.0")
     implementation("androidx.browser:browser:1.8.0")
+    implementation("androidx.webkit:webkit:1.14.0")
     implementation("androidx.datastore:datastore-preferences:1.1.7")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
