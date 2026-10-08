@@ -122,10 +122,20 @@ class TokenStore(context: Context) {
             .put("userId", tokens.userId)
             .toString()
             .toByteArray(Charsets.UTF_8)
-        val iv = ByteArray(12).also { SecureRandom().nextBytes(it) }
+        // Android Keystore keys require randomized encryption by default, so the
+        // cipher must pick its own IV. Passing a caller-made IV here throws
+        // InvalidAlgorithmParameterException ("Caller-provided IV not permitted").
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, key(), GCMParameterSpec(128, iv))
-        file.writeBytes(iv + cipher.doFinal(json))
+        cipher.init(Cipher.ENCRYPT_MODE, key())
+        val iv = cipher.iv
+        check(iv != null && iv.size == 12) { "unexpected GCM IV" }
+        val sealed = cipher.doFinal(json)
+        val tmp = File(file.parentFile, file.name + ".tmp")
+        tmp.writeBytes(iv + sealed)
+        if (!tmp.renameTo(file)) {
+            file.writeBytes(iv + sealed)
+            tmp.delete()
+        }
     }
 
     fun clear() = synchronized(lock) { file.delete() }
@@ -407,8 +417,13 @@ class GatewayHttp(context: Context, private val tokens: TokenStore) {
         val response = client.newCall(request).execute()
         val text = response.body?.string().orEmpty()
         if (!response.isSuccessful) {
-            tokens.clear()
-            return false
+            // 400/401 mean the refresh token is dead. Anything else (503 provider
+            // unreachable, 5xx) is transient, so keep the tokens for the next try.
+            if (response.code == 400 || response.code == 401) {
+                tokens.clear()
+                return false
+            }
+            throw RpcException(response.code, "The computer could not renew the sign-in (${response.code}). Try again.", null)
         }
         val json = JSONObject(text)
         tokens.write(
@@ -439,35 +454,78 @@ object Pkce {
     }
 }
 
+/** Deep link the loopback page uses to bring Hermes Jr. back to the front. */
+const val RETURN_SCHEME = "hermesjr"
+const val RETURN_HOST = "signed-in"
+private const val RETURN_INTENT =
+    "intent://$RETURN_HOST#Intent;scheme=$RETURN_SCHEME;package=com.nousresearch.hermes.jr;end"
+
+private fun loopbackPage(ok: Boolean): String {
+    val title = if (ok) "Signed in" else "Sign-in did not finish"
+    val line = if (ok) "Returning to Hermes Jr." else "Go back to Hermes Jr. and tap Sign in again."
+    val auto = if (ok) "<script>setTimeout(function(){location.replace('$RETURN_INTENT')},150)</script>" else ""
+    return """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>$title</title><style>body{background:#0d1117;color:#e6edf3;font:16px system-ui,sans-serif;display:flex;min-height:90vh;align-items:center;justify-content:center;text-align:center}
+a{display:inline-block;margin-top:16px;padding:12px 20px;border-radius:10px;background:#2f81f7;color:#fff;text-decoration:none}</style></head>
+<body><div><h2>$title</h2><p>$line</p><a href="$RETURN_INTENT">Open Hermes Jr.</a></div>$auto</body></html>"""
+}
+
+/**
+ * Waits for the gateway's loopback redirect (GET /cb?code=…&state=…) and returns (code, state).
+ * Each connection is handled on its own thread so a browser preconnect or a favicon request
+ * cannot swallow or block the real callback.
+ */
 suspend fun awaitLoopback(server: java.net.ServerSocket): Pair<String, String> = suspendCancellableCoroutine { cont ->
+    val done = java.util.concurrent.atomic.AtomicBoolean(false)
+    fun handle(client: java.net.Socket) {
+        client.use { sock ->
+            sock.soTimeout = 15_000
+            val reader = sock.getInputStream().bufferedReader()
+            val request = reader.readLine().orEmpty()
+            while (true) {
+                val line = reader.readLine() ?: break
+                if (line.isEmpty()) break
+            }
+            val target = request.substringAfter(' ', "").substringBefore(' ')
+            val path = target.substringBefore('?')
+            if (path != "/cb") {
+                sock.getOutputStream().apply {
+                    write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
+                    flush()
+                }
+                return
+            }
+            val map = target.substringAfter("?", "").split("&").mapNotNull {
+                val parts = it.split("=", limit = 2)
+                if (parts.size == 2) parts[0] to java.net.URLDecoder.decode(parts[1], "UTF-8") else null
+            }.toMap()
+            val code = map["code"].orEmpty()
+            val bytes = loopbackPage(code.isNotBlank()).toByteArray()
+            sock.getOutputStream().apply {
+                write("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nContent-Length: ${bytes.size}\r\nConnection: close\r\n\r\n".toByteArray())
+                write(bytes)
+                flush()
+            }
+            if (done.compareAndSet(false, true) && cont.isActive) cont.resume(code to map["state"].orEmpty())
+        }
+    }
     val thread = Thread {
         try {
             server.soTimeout = 10 * 60 * 1000
-            val socket = server.accept()
-            socket.use { client ->
-                val reader = client.getInputStream().bufferedReader()
-                val request = reader.readLine().orEmpty()
-                while (true) {
-                    val line = reader.readLine() ?: break
-                    if (line.isEmpty()) break
-                }
-                val html = "<html><body><p>Signed in. You can close this tab.</p></body></html>"
-                val bytes = html.toByteArray()
-                val response = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ${bytes.size}\r\nConnection: close\r\n\r\n$html"
-                client.getOutputStream().write(response.toByteArray())
-                client.getOutputStream().flush()
-                val query = request.substringAfter("?", "").substringBefore(" ")
-                val map = query.split("&").mapNotNull {
-                    val parts = it.split("=", limit = 2)
-                    if (parts.size == 2) parts[0] to java.net.URLDecoder.decode(parts[1], "UTF-8") else null
-                }.toMap()
-                if (cont.isActive) cont.resume(map["code"].orEmpty() to map["state"].orEmpty())
+            while (!done.get() && cont.isActive) {
+                val client = server.accept()
+                Thread {
+                    try {
+                        handle(client)
+                    } catch (_: Exception) {
+                    }
+                }.apply { isDaemon = true }.start()
             }
         } catch (error: Exception) {
-            if (cont.isActive) cont.resumeWithException(error)
+            if (done.compareAndSet(false, true) && cont.isActive) cont.resumeWithException(error)
         }
     }
-    cont.invokeOnCancellation { server.close() }
+    cont.invokeOnCancellation { runCatching { server.close() } }
     thread.isDaemon = true
     thread.start()
 }

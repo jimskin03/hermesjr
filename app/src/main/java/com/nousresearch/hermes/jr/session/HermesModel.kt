@@ -145,18 +145,36 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             _state.value = _state.value.copy(busy = true, notice = "")
             try {
-                val normalized = normalizeBase(raw)
+                var normalized = try {
+                    normalizeBase(raw)
+                } catch (_: Exception) {
+                    errorNotice("That address is not a valid URL.")
+                }
                 val host = URI(normalized).host ?: errorNotice("That address is not a host.")
                 if (hostIsPhoneLoopback(host)) errorNotice("That address is this phone.")
+                // A hostname (MagicDNS, .local) needs a DNS lookup, which is not allowed on the main thread.
                 val privateHost = try {
-                    addressesArePrivate(host)
+                    io { addressesArePrivate(host) }
                 } catch (_: Exception) {
                     errorNotice("Could not find that computer.")
                 }
                 if (!normalized.startsWith("https://") && !privateHost) {
                     errorNotice("Refusing a public address over plain HTTP.")
                 }
-                val status = io { http.get("$normalized/api/status", auth = false) }
+                val status = try {
+                    io { http.get("$normalized/api/status", auth = false) }
+                } catch (error: java.io.IOException) {
+                    if (!normalized.startsWith("https://") || !privateHost) throw error
+                    // hermes serve speaks plain HTTP unless something terminates TLS in front of it.
+                    val plain = "http://" + normalized.removePrefix("https://")
+                    val probe = try {
+                        io { http.get("$plain/api/status", auth = false) }
+                    } catch (_: Exception) {
+                        throw error
+                    }
+                    normalized = plain
+                    probe
+                }
                 val providers = strings(status.optJSONArray("auth_providers"))
                 JrLog.i("probe auth_required=${status.optBoolean("auth_required")} providers=${providers.size}")
                 if (!status.optBoolean("auth_required")) errorNotice("This computer is not asking anyone to sign in.")
@@ -187,6 +205,9 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
                 if (install.isNotBlank()) store.saveInstall(install)
                 store.saveUrl(normalized)
                 base = normalized
+                if (note.isBlank() && raw.trim().startsWith("https://") && normalized.startsWith("http://")) {
+                    note = "This computer answers over plain HTTP, not HTTPS. Using $normalized."
+                }
                 val signedIn = tokens.read() != null
                 _state.value = _state.value.copy(busy = false, baseUrl = normalized, ready = false, notice = note)
                 if (signedIn) {
@@ -206,7 +227,13 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
         signJob?.cancel()
         signJob = viewModelScope.launch {
             _state.value = _state.value.copy(busy = true, notice = "")
-            val server = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))
+            var stage = "Could not start sign-in"
+            val server = try {
+                ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"))
+            } catch (error: Exception) {
+                _state.value = _state.value.copy(busy = false, notice = "$stage: ${error.jr()}")
+                return@launch
+            }
             try {
                 val verifier = Pkce.verifier()
                 val state = ident()
@@ -219,8 +246,10 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
                 signProvider?.let { authorize.append("&provider=").append(enc(it)) }
                 CustomTabsIntent.Builder().setShowTitle(true).build()
                     .launchUrl(context, Uri.parse(authorize.toString()))
+                stage = "Sign-in did not finish"
                 val (code, got) = awaitLoopback(server)
                 if (got != state || code.isBlank()) errorNotice("Sign-in did not finish. Try again.")
+                stage = "Could not exchange the sign-in code with the computer"
                 val body = io {
                     http.post(
                         "$base/auth/native/token",
@@ -228,21 +257,32 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
                         auth = false,
                     )
                 }
-                tokens.write(
-                    TokenStore.Tokens(
-                        access = body.getString("access_token"),
-                        refresh = body.getString("refresh_token"),
-                        provider = body.optString("provider", signProvider.orEmpty()),
-                        userId = body.optString("user_id"),
-                    ),
-                )
+                if (body.optString("access_token").isBlank() || body.optString("refresh_token").isBlank()) {
+                    errorNotice("$stage: the computer answered without tokens. Update Hermes on the computer.")
+                }
+                stage = "Signed in, but could not save the sign-in on this phone"
+                io {
+                    tokens.write(
+                        TokenStore.Tokens(
+                            access = body.getString("access_token"),
+                            refresh = body.getString("refresh_token"),
+                            provider = body.optString("provider", signProvider.orEmpty()),
+                            userId = body.optString("user_id"),
+                        ),
+                    )
+                }
+                if (tokens.read() == null) errorNotice("$stage: the stored sign-in could not be read back.")
+                JrLog.i("sign-in complete")
                 wantSocket = true
                 _state.value = _state.value.copy(busy = false)
                 openSocket()
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
             } catch (error: Notice) {
                 _state.value = _state.value.copy(busy = false, notice = error.message.orEmpty())
             } catch (error: Exception) {
-                _state.value = _state.value.copy(busy = false, notice = error.jr())
+                JrLog.i("sign-in failed at '$stage': ${error.javaClass.name}")
+                _state.value = _state.value.copy(busy = false, notice = "$stage: ${error.jr()}")
             } finally {
                 try {
                     server.close()
@@ -1419,8 +1459,11 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
         is Notice -> message.orEmpty()
         is RpcException -> message?.take(300)?.ifBlank { null } ?: "The computer rejected that."
         is java.net.SocketTimeoutException -> "The computer did not answer."
-        is java.io.IOException -> message?.take(180)?.ifBlank { null } ?: "Could not reach the computer."
-        else -> "Could not reach the computer."
+        is javax.net.ssl.SSLException -> "HTTPS failed (${message?.take(120) ?: javaClass.simpleName}). If hermes serve runs without TLS, use http:// instead."
+        is java.net.ConnectException -> "${message?.take(160) ?: "Could not connect"}. Check the address, the port, and that hermes serve is running."
+        is java.net.UnknownHostException -> "Could not find that computer."
+        is java.io.IOException -> message?.take(180)?.ifBlank { null } ?: "Could not reach the computer (${javaClass.simpleName})."
+        else -> "${javaClass.simpleName}: ${message?.take(200).orEmpty()}".trimEnd(':', ' ')
     }
 }
 

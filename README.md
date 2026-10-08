@@ -74,7 +74,7 @@ The app refuses a few addresses before it will talk:
 - A gateway without native sign-in. Update Hermes on the computer.
 - A password sent to a public address. Use Tailscale, or OAuth, for anything off your own network.
 
-Sign-in uses the system browser and a loopback redirect on the phone. Tokens stay in the Android Keystore. Sign out on the phone deletes those tokens only. There is no remote sign-out for one Jr. device. If the phone is lost and the computer uses a password, replace `HERMES_DASHBOARD_BASIC_AUTH_SECRET` and restart the supervised gateway. That ends every password session for the install, including the desktop. A password change alone does not.
+Sign-in uses the system browser and a loopback redirect on the phone. After you sign in, the browser page sends you back to Hermes Jr.; if your browser blocks that, tap Open Hermes Jr. on the page. Use `http://` for a plain `hermes serve`; if you type `https://` and the computer only answers over HTTP on a private or Tailscale address, the app switches to `http://` and says so. Tokens stay in the Android Keystore. Sign out on the phone deletes those tokens only. There is no remote sign-out for one Jr. device. If the phone is lost and the computer uses a password, replace `HERMES_DASHBOARD_BASIC_AUTH_SECRET` and restart the supervised gateway. That ends every password session for the install, including the desktop. A password change alone does not.
 
 ## Build
 
