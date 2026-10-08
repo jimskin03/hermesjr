@@ -95,6 +95,10 @@ fun OpenUiRoomPane(state: UiState, model: HermesModel) {
             TextButton(onClick = { roundsOpen = true }) { Text("Rounds ${room.maxRounds}", color = Accent) }
             TextButton(onClick = { disband = true }) { Text("Disband", color = Danger) }
         }
+        // Approvals / retries a room turn is waiting on stay native (same row as the Compose room).
+        room.pending.distinctBy { it.requestId.ifBlank { it.taskId } }.forEach { action ->
+            Column(Modifier.padding(horizontal = 12.dp)) { PendingRow(action, model) }
+        }
         OpenUiWebView(
             modifier = Modifier.fillMaxWidth().weight(1f),
             snapshotJson = remember(room, state.openUiRichDefault) { roomSnapshotJson(state) },
@@ -363,7 +367,8 @@ internal fun roomSnapshotJson(state: UiState): String {
         .put("title", room.name)
         .put("messages", messages)
         .put("streaming", room.live.isNotBlank())
-        .put("thinking", JSONArray(room.thinking))
+        // Like the Compose room: a member whose reply is already streaming is not "thinking".
+        .put("thinking", JSONArray(room.thinking.filter { it != room.liveWho || room.live.isBlank() }))
         .put("activity", "")
         .put("reasoning", "")
         .put("richUiDefault", false)

@@ -643,7 +643,7 @@ private fun RoomPane(state: UiState, model: HermesModel) {
 }
 
 @Composable
-private fun PendingRow(action: PendingAction, model: HermesModel) {
+internal fun PendingRow(action: PendingAction, model: HermesModel) {
     Column(Modifier.padding(vertical = 6.dp)) {
         Text(action.label, color = Ink)
         Row {

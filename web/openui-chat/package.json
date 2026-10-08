@@ -9,15 +9,16 @@
     "gen:prompt": "node scripts/gen-prompt.mjs"
   },
   "dependencies": {
+    "@openuidev/react-headless": "0.17.0",
     "@openuidev/react-lang": "0.3.2",
     "@openuidev/react-ui": "0.17.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "react-markdown": "^10.1.0",
+    "remark-breaks": "^4.0.0",
     "remark-gfm": "^4.0.1",
     "zod": "^4.0.0",
-    "zustand": "^4.5.5",
-    "@openuidev/react-headless": "0.17.0"
+    "zustand": "^4.5.5"
   },
   "devDependencies": {
     "@types/react": "^19.0.0",

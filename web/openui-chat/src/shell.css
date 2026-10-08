@@ -120,3 +120,5 @@
 .openui-root .openui-follow-up-item-text { color: #e0a95f; flex: 0 1 auto; }
 .openui-root .openui-follow-up-item svg { color: #e0a95f; flex-shrink: 0; }
 .openui-root img { max-width: 100%; height: auto; border-radius: 8px; }
+
+.building { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; font-style: italic; padding: 2px 0; }

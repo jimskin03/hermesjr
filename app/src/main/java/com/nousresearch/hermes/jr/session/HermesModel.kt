@@ -73,6 +73,8 @@ data class RoomEvent(
     val profile: String = "",
     /** Optimistic local echo the server has not confirmed yet. */
     val sending: Boolean = false,
+    /** The event_id this phone sent with groups.send (older servers log it unchanged). */
+    val clientId: String = "",
 )
 data class PendingAction(val kind: String, val memberId: String, val taskId: String, val generation: Int, val requestId: String, val choices: List<String>, val label: String)
 data class RoomView(
@@ -736,15 +738,18 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
         val outbound = if (richUi) withUiFormat(body) else body
         chainHalted -= room.id
         val eventId = ident()
+        // hermes serve logs the user event as user:<sha256(client event_id)>; match the echo to that.
+        val serverId = userEventId(eventId)
         val echo = RoomEvent(
             seq = Int.MAX_VALUE,
             who = "you",
             text = body,
-            key = "e-$eventId",
+            key = "e-$serverId",
             role = "user",
-            eventId = eventId,
+            eventId = serverId,
             at = System.currentTimeMillis(),
             sending = true,
+            clientId = eventId,
         )
         _state.value.room?.takeIf { it.id == room.id }?.let { current ->
             _state.value = _state.value.copy(room = current.copy(events = mergeEvent(current.events, echo).takeLast(500)))
@@ -762,7 +767,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
                 throw error
             } catch (error: Exception) {
                 _state.value.room?.takeIf { it.id == room.id }?.let { current ->
-                    _state.value = _state.value.copy(room = current.copy(events = current.events.filterNot { it.eventId == eventId && it.sending }))
+                    _state.value = _state.value.copy(room = current.copy(events = current.events.filterNot { it.clientId == eventId && it.sending }))
                 }
                 note("Not sent: ${error.jr()}")
             }
@@ -1667,7 +1672,9 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
         if (type == "error") note(payload.optString("message").ifBlank { "The computer reported an error." })
         if (chat?.sessionId == sid) {
             val draft = chat.draft
-            val lines = if (draft.isNotBlank() && type != "message.complete") chat.lines + Line("assistant", draft) else chat.lines
+            // Keep the streamed reply on screen while the history reload below is in flight; the
+            // reload then replaces the whole transcript (no flash of a missing reply).
+            val lines = if (draft.isNotBlank()) chat.lines + Line("assistant", draft) else chat.lines
             _state.value = _state.value.copy(chat = chat.copy(lines = lines, draft = "", streaming = false, reasoning = "", activity = ""))
             if (type == "message.complete") {
                 viewModelScope.launch(safe) {
@@ -1679,10 +1686,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
                             remember()
                         }
                     } catch (_: Exception) {
-                        val current = _state.value.chat
-                        if (current?.sessionId == sid && draft.isNotBlank()) {
-                            _state.value = _state.value.copy(chat = current.copy(lines = current.lines + Line("assistant", draft), draft = ""))
-                        }
+                        // The streamed reply is already in the transcript; keep it.
                     }
                 }
             }
@@ -2010,9 +2014,18 @@ private fun eventLine(event: JSONObject, members: List<Member>): RoomEvent? {
     }
 }
 
+/** hermes serve's server-owned id for a user event sent with [clientEventId] (gateway/hosted_rooms.py user_event_id). */
+internal fun userEventId(clientEventId: String): String {
+    val digest = java.security.MessageDigest.getInstance("SHA-256").digest(clientEventId.toByteArray(Charsets.UTF_8))
+    return "user:" + digest.joinToString("") { "%02x".format(it) }
+}
+
 /** Insert or replace by event id (a server echo replaces its optimistic local copy), kept in seq order. */
 internal fun mergeEvent(list: List<RoomEvent>, line: RoomEvent): List<RoomEvent> {
-    val index = list.indexOfFirst { it.eventId.isNotBlank() && it.eventId == line.eventId }
+    val index = list.indexOfFirst {
+        (it.eventId.isNotBlank() && it.eventId == line.eventId) ||
+            (it.sending && it.clientId.isNotBlank() && it.clientId == line.eventId)
+    }
     if (index >= 0) {
         val old = list[index]
         return list.toMutableList().also { it[index] = line.copy(at = if (line.at > 0) line.at else old.at) }

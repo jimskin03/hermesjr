@@ -127,14 +127,25 @@ export function App() {
     };
   }, []);
 
+  const lastLen = snap.messages.length ? snap.messages[snap.messages.length - 1].text.length : 0;
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [snap.messages.length, snap.streaming, snap.thinking.join(","), snap.activity, snap.reasoning.length]);
+    // Follow the conversation, including a reply that is still streaming (its text grows in place).
+    const list = listRef.current;
+    const nearBottom = !list || list.scrollHeight - list.scrollTop - list.clientHeight < 240;
+    if (nearBottom) bottomRef.current?.scrollIntoView({ block: "end" });
+  }, [snap.messages.length, lastLen, snap.streaming, snap.thinking.join(","), snap.activity, Math.floor(snap.reasoning.length / 200)]);
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ block: "end" });
+  }, [snap.kind, snap.title]);
 
   const visible = useMemo(
     () => snap.messages.filter((m) => m.role !== "system" && (m.text || m.role === "notice")),
     [snap.messages],
   );
+
+  const liveReply = visible.find((m) => m.live);
+  // A member whose reply is already streaming is not shown as "thinking" (matches the Compose room).
+  const waiting = snap.thinking.filter((name) => !liveReply || liveReply.who !== name);
 
   function onSend() {
     const body = text.trim();
@@ -174,25 +185,33 @@ export function App() {
           return <Bubble key={msg.id} msg={msg} showHeader={!grouped} />;
         })}
 
-        {snap.reasoning && (
-          <div className="reasoning">{snap.reasoning.slice(0, 400)}{snap.reasoning.length > 400 ? "…" : ""}</div>
-        )}
-        {snap.activity && <div className="tool">Using {snap.activity}</div>}
-
-        {snap.thinking.length > 0 && (
+        {snap.kind === "chat" && snap.streaming && !liveReply && (
           <div className="typing">
-            <Avatar name={snap.thinking[0]} size={22} />
+            <Avatar name={snap.title || "bot"} size={22} />
             <span>
-              {snap.thinking.length === 1
-                ? `@${snap.thinking[0]} is thinking`
-                : snap.thinking.length === 2
-                  ? `@${snap.thinking[0]} and @${snap.thinking[1]} are thinking`
-                  : `${snap.thinking.length} bots are thinking`}
+              {snap.activity ? `Using ${snap.activity}` : snap.reasoning ? "Thinking" : `${snap.title || "The bot"} is working`}
             </span>
             <span className="dots"><i /><i /><i /></span>
           </div>
         )}
-        {!snap.thinking.length && snap.working && !snap.streaming && (
+        {snap.kind === "chat" && snap.streaming && snap.reasoning && (
+          <div className="reasoning">{snap.reasoning.length > 280 ? "…" + snap.reasoning.slice(-280) : snap.reasoning}</div>
+        )}
+
+        {waiting.length > 0 && (
+          <div className="typing">
+            <Avatar name={waiting[0]} size={22} />
+            <span>
+              {waiting.length === 1
+                ? `@${waiting[0]} is thinking`
+                : waiting.length === 2
+                  ? `@${waiting[0]} and @${waiting[1]} are thinking`
+                  : `${waiting.length} bots are thinking`}
+            </span>
+            <span className="dots"><i /><i /><i /></span>
+          </div>
+        )}
+        {!waiting.length && snap.working && !snap.streaming && (
           <div className="typing"><span>Working</span><span className="dots"><i /><i /><i /></span></div>
         )}
         <div ref={bottomRef} />

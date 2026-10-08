@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkBreaks from "remark-breaks";
 import { Renderer } from "@openuidev/react-lang";
 import { openuiChatLibrary } from "@openuidev/react-ui/genui-lib";
 import { describeForm, looksLikeOpenUi, unwrapFence } from "./openuiDetect";
@@ -12,7 +13,7 @@ function MarkdownBody({ text }: { text: string }) {
   return (
     <div className="md">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkBreaks]}
         components={{
           a: ({ href, children }) => (
             <a
@@ -53,6 +54,7 @@ export function MessageBody({ text, streaming, interactive = true }: Props) {
   const code = useMemo(() => unwrapFence(text), [text]);
   const tryOpenUi = useMemo(() => looksLikeOpenUi(text), [text]);
   const [failed, setFailed] = useState(false);
+  const [hasRoot, setHasRoot] = useState(false);
 
   useEffect(() => {
     if (streaming) setFailed(false);
@@ -62,11 +64,13 @@ export function MessageBody({ text, streaming, interactive = true }: Props) {
 
   return (
     <div className="openui-root">
+      {streaming && !hasRoot && <div className="building">Building card<span className="dots"><i /><i /><i /></span></div>}
       <Renderer
         response={code}
         library={openuiChatLibrary}
         isStreaming={!!streaming}
         onParseResult={(result) => {
+          setHasRoot(!!result?.root);
           if (streaming || !result) return;
           if (!result.root || result.meta.errors.length > 0) setFailed(true);
         }}
