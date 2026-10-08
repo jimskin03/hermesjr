@@ -68,6 +68,8 @@ data class ScreenState(
 data class UiState(
     val booting: Boolean = true,
     val busy: Boolean = false,
+    /** Browser sign-in is open and the app is waiting for the loopback callback. */
+    val signingIn: Boolean = false,
     val ready: Boolean = false,
     val baseUrl: String = "",
     val notice: String = "",
@@ -142,8 +144,9 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun useHost(raw: String) {
+        signJob?.cancel()
         viewModelScope.launch {
-            _state.value = _state.value.copy(busy = true, notice = "")
+            _state.value = _state.value.copy(busy = true, signingIn = false, notice = "")
             try {
                 var normalized = try {
                     normalizeBase(raw)
@@ -244,10 +247,18 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
                     .append(enc(redirect))
                     .append("&state=").append(enc(state))
                 signProvider?.let { authorize.append("&provider=").append(enc(it)) }
-                CustomTabsIntent.Builder().setShowTitle(true).build()
-                    .launchUrl(context, Uri.parse(authorize.toString()))
+                try {
+                    CustomTabsIntent.Builder().setShowTitle(true).build()
+                        .launchUrl(context, Uri.parse(authorize.toString()))
+                } catch (_: android.content.ActivityNotFoundException) {
+                    errorNotice("No web browser is installed. Install or enable a browser, then tap Sign in again.")
+                }
                 stage = "Sign-in did not finish"
+                // Waiting on the browser can take minutes, or never finish if the tab is closed.
+                // Leave the buttons usable so Sign in can restart the flow.
+                _state.value = _state.value.copy(busy = false, signingIn = true)
                 val (code, got) = awaitLoopback(server)
+                _state.value = _state.value.copy(busy = true, signingIn = false)
                 if (got != state || code.isBlank()) errorNotice("Sign-in did not finish. Try again.")
                 stage = "Could not exchange the sign-in code with the computer"
                 val body = io {
@@ -279,10 +290,10 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
             } catch (error: kotlinx.coroutines.CancellationException) {
                 throw error
             } catch (error: Notice) {
-                _state.value = _state.value.copy(busy = false, notice = error.message.orEmpty())
+                _state.value = _state.value.copy(busy = false, signingIn = false, notice = error.message.orEmpty())
             } catch (error: Exception) {
                 JrLog.i("sign-in failed at '$stage': ${error.javaClass.name}")
-                _state.value = _state.value.copy(busy = false, notice = "$stage: ${error.jr()}")
+                _state.value = _state.value.copy(busy = false, signingIn = false, notice = "$stage: ${error.jr()}")
             } finally {
                 try {
                     server.close()

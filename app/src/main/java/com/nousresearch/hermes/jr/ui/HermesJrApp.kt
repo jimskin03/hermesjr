@@ -190,11 +190,13 @@ private fun ConnectScreen(state: UiState, model: HermesModel) {
             }
             if (state.baseUrl.isNotBlank()) {
                 Button(onClick = { model.signIn(context) }, enabled = !state.busy, colors = ButtonDefaults.buttonColors(containerColor = Elevated, contentColor = Ink)) {
-                    Text("Sign in")
+                    Text(if (state.signingIn) "Sign in again" else "Sign in")
                 }
             }
         }
-        if (state.baseUrl.isNotBlank()) {
+        if (state.signingIn) {
+            Text("Finish signing in in the browser. If you closed it, tap Sign in again.", color = Muted, fontSize = 13.sp)
+        } else if (state.baseUrl.isNotBlank()) {
             Text("Connected probe saved for ${state.baseUrl}. Sign in to open chats.", color = Muted, fontSize = 13.sp)
         }
         if (state.notice.isNotBlank()) Text(state.notice, color = Danger)
