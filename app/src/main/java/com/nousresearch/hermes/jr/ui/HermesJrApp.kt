@@ -81,6 +81,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.nousresearch.hermes.jr.session.Card
+import com.nousresearch.hermes.jr.session.DEFAULT_BOT_ROUNDS
 import com.nousresearch.hermes.jr.session.HermesModel
 import com.nousresearch.hermes.jr.session.McpServer
 import com.nousresearch.hermes.jr.session.PendingAction
@@ -327,6 +328,7 @@ private fun GatewaySetup() {
 
 @Composable
 private fun ChatsPane(state: UiState, model: HermesModel) {
+    var rounds by rememberSaveable { mutableStateOf(DEFAULT_BOT_ROUNDS) }
     var creating by rememberSaveable { mutableStateOf(false) }
     var name by rememberSaveable { mutableStateOf("") }
     var picked by remember { mutableStateOf(setOf<String>()) }
@@ -367,10 +369,11 @@ private fun ChatsPane(state: UiState, model: HermesModel) {
                             picked = if (on) picked - bot.name else if (picked.size < 6) picked + bot.name else picked
                         }) { Text(if (on) "✓ ${bot.name}" else bot.name, color = if (on) Accent else Ink) }
                     }
+                    RoundsStepper(rounds) { rounds = it }
                 }
             },
             confirmButton = {
-                TextButton(onClick = { model.createRoom(name, picked.toList()); creating = false }) { Text("Create", color = Accent) }
+                TextButton(onClick = { model.createRoom(name, picked.toList(), rounds); creating = false }) { Text("Create", color = Accent) }
             },
             dismissButton = { TextButton(onClick = { creating = false }) { Text("Cancel", color = Muted) } },
         )
@@ -510,6 +513,7 @@ private fun RoomPane(state: UiState, model: HermesModel) {
     var name by rememberSaveable { mutableStateOf(room.name) }
     var disband by rememberSaveable { mutableStateOf(false) }
     var editing by rememberSaveable { mutableStateOf(false) }
+    var roundsOpen by rememberSaveable { mutableStateOf(false) }
     var picked by remember { mutableStateOf(room.members.map { it.profile }.toSet()) }
     Column(Modifier.fillMaxSize().imePadding()) {
         Text(room.name, color = Ink, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
@@ -518,6 +522,7 @@ private fun RoomPane(state: UiState, model: HermesModel) {
             TextButton(onClick = model::stopRoom) { Text("Stop", color = Accent) }
             TextButton(onClick = { renaming = true }) { Text("Rename", color = Accent) }
             if (state.membersEditable) TextButton(onClick = { editing = true }) { Text("Members", color = Accent) }
+            TextButton(onClick = { roundsOpen = true }) { Text("Rounds ${room.maxRounds}", color = Accent) }
             TextButton(onClick = { disband = true }) { Text("Disband", color = Danger) }
         }
         val list = rememberLazyListState()
@@ -585,6 +590,17 @@ private fun RoomPane(state: UiState, model: HermesModel) {
             text = { OutlinedTextField(name, { name = it }, colors = fieldColors()) },
             confirmButton = { TextButton(onClick = { model.renameRoom(name); renaming = false }) { Text("Save", color = Accent) } },
             dismissButton = { TextButton(onClick = { renaming = false }) { Text("Cancel", color = Muted) } },
+        )
+    }
+    if (roundsOpen) {
+        var value by remember { mutableStateOf(room.maxRounds) }
+        AlertDialog(
+            onDismissRequest = { roundsOpen = false },
+            containerColor = Elevated,
+            title = { Text("Max bot rounds", color = Ink) },
+            text = { RoundsStepper(value) { value = it } },
+            confirmButton = { TextButton(onClick = { model.setMaxRounds(value); roundsOpen = false }) { Text("Save", color = Accent) } },
+            dismissButton = { TextButton(onClick = { roundsOpen = false }) { Text("Cancel", color = Muted) } },
         )
     }
     if (disband) {
@@ -995,5 +1011,34 @@ private fun AutoScroll(list: LazyListState, count: Int, growth: Int) {
     LaunchedEffect(growth) {
         val total = list.layoutInfo.totalItemsCount
         if (atBottom && total > 0) list.scrollToItem(total - 1, Int.MAX_VALUE / 2)
+    }
+}
+
+/**
+ * "Max bot rounds" — the desktop's GROUP_CHAT_MAX_ROUNDS (3) as a per-room setting. Round 1 is the
+ * server's own discussion of your message; each further round is a marked follow-up this phone posts
+ * when one bot @mentions another that never answered. Stop ends the chain.
+ */
+@Composable
+private fun RoundsStepper(value: Int, onChange: (Int) -> Unit) {
+    Column(Modifier.padding(top = 8.dp)) {
+        Text("Max bot rounds per message", color = Ink, fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = { onChange((value - 1).coerceAtLeast(1)) }, enabled = value > 1) { Text("−", color = Accent, fontSize = 20.sp) }
+            Text("$value", color = Ink, fontSize = 18.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 8.dp))
+            TextButton(onClick = { onChange((value + 1).coerceAtMost(10)) }, enabled = value < 10) { Text("+", color = Accent, fontSize = 20.sp) }
+            if (value == DEFAULT_BOT_ROUNDS) Text("default", color = Muted, fontSize = 12.sp)
+        }
+        Text(
+            if (value <= 1) {
+                "Bots answer your message only (the computer's own rules). No follow-ups from this phone."
+            } else {
+                "When a bot @mentions another bot that doesn't answer, this phone posts a marked follow-up " +
+                    "so they can talk to each other — up to $value rounds per message and 10 bot replies. " +
+                    "Stop ends it. Saved on this phone."
+            },
+            color = Muted,
+            fontSize = 12.sp,
+        )
     }
 }

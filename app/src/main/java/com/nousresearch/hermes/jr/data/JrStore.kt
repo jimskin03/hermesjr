@@ -17,6 +17,8 @@ class JrStore(context: Context) {
         val cursors: String = "{}",
         val transcript: String = "",
         val roomEvents: String = "",
+        /** JSON object room_id -> max bot rounds (this phone's bot-to-bot follow-up budget). */
+        val roomRounds: String = "{}",
     )
 
     suspend fun read(): Saved {
@@ -27,6 +29,7 @@ class JrStore(context: Context) {
             cursors = prefs[CURSORS] ?: "{}",
             transcript = prefs[TRANSCRIPT].orEmpty(),
             roomEvents = prefs[ROOMS].orEmpty(),
+            roomRounds = prefs[ROUNDS] ?: "{}",
         )
     }
 
@@ -46,6 +49,10 @@ class JrStore(context: Context) {
         }
     }
 
+    suspend fun saveRoomRounds(json: String) {
+        store.edit { it[ROUNDS] = json }
+    }
+
     suspend fun wipeSession() {
         store.edit {
             val url = it[URL]
@@ -60,5 +67,6 @@ class JrStore(context: Context) {
         val CURSORS = stringPreferencesKey("room_cursors")
         val TRANSCRIPT = stringPreferencesKey("transcript")
         val ROOMS = stringPreferencesKey("room_events")
+        val ROUNDS = stringPreferencesKey("room_rounds")
     }
 }

@@ -90,7 +90,16 @@ data class RoomView(
     /** member_id -> display name for members whose turn has started and not settled. */
     val activeTurns: Map<String, String> = emptyMap(),
     val loaded: Boolean = false,
+    /** Max bot rounds per user message (1 = only the server's own discussion, no app follow-ups). */
+    val maxRounds: Int = DEFAULT_BOT_ROUNDS,
 )
+
+/** The desktop app's GROUP_CHAT_MAX_ROUNDS (apps/desktop/.../hermes-bots/group-chat.ts). */
+const val DEFAULT_BOT_ROUNDS = 3
+/** The desktop's GROUP_CHAT_MAX_MESSAGES: bot messages one user send may cause, in total. */
+const val MAX_BOT_MESSAGES_PER_SEND = 10
+/** Prefix of a user event this app posted to continue a bot-to-bot exchange. */
+const val FOLLOW_UP_MARK = "\u21AA "
 data class MirrorRoom(val id: String, val name: String, val lines: List<String>, val omitted: Int)
 data class McpServer(val name: String, val source: String, val enabled: Boolean, val detail: String, val status: String)
 data class McpView(val profile: String, val servers: List<McpServer>, val catalog: List<Pair<String, String>>)
@@ -146,6 +155,11 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
      * Last line of defence: an unexpected exception in any model coroutine (a server payload with a
      * shape this build does not expect, a bug) becomes a notice instead of killing the process.
      */
+    /** room_id -> max bot rounds, persisted on this phone (the server has no such room option). */
+    private val roomRounds = mutableMapOf<String, Int>()
+    /** Rooms where Stop was pressed: no app follow-ups until the user sends again. */
+    private val chainHalted = mutableSetOf<String>()
+
     private val safe = CoroutineExceptionHandler { _, error ->
         JrLog.i("uncaught in model: ${error.javaClass.name}: ${error.message}")
         Log.e("HermesJr", "uncaught in model coroutine", error)
@@ -203,6 +217,11 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
             val saved = store.read()
             base = saved.baseUrl
             parseCursors(saved.cursors)
+            try {
+                val json = JSONObject(saved.roomRounds)
+                json.keys().forEach { key -> roomRounds[key] = json.optInt(key, DEFAULT_BOT_ROUNDS).coerceIn(1, 10) }
+            } catch (_: Exception) {
+            }
             _state.value = _state.value.copy(baseUrl = saved.baseUrl, booting = false)
             if (saved.baseUrl.isNotBlank() && tokens.read() != null) useHost(saved.baseUrl)
         }
@@ -593,11 +612,12 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
         roomJob = viewModelScope.launch(safe) {
             val row = _state.value.rooms.find { it.id == id }
             _state.value = _state.value.copy(
-                room = RoomView(id, row?.name ?: id, emptyList(), emptyList(), emptyList(), false, ""),
+                room = RoomView(id, row?.name ?: id, emptyList(), emptyList(), emptyList(), false, "", maxRounds = roomRounds[id] ?: DEFAULT_BOT_ROUNDS),
             )
             // Always rebuild the transcript from the server log: the local cursor only says what was
             // seen, the visible history is not cached, so starting from it opened rooms empty.
             var since = -1
+            val chain = BotChain()
             while (isActive && _state.value.room?.id == id) {
                 try {
                     val state = rpc("groups.state", JSONObject().put("room_id", id))
@@ -618,6 +638,14 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
                         if (batch.size < 200) break
                     }
                     cursors[id] = since
+                    if (chain.liveFrom < 0) chain.liveFrom = since
+                    val followUp = try {
+                        chain.observe(events, members, _state.value.room?.maxRounds ?: DEFAULT_BOT_ROUNDS, id in chainHalted)
+                    } catch (error: Exception) {
+                        JrLog.i("bot chain: ${error.javaClass.simpleName}")
+                        null
+                    }
+                    if (followUp != null) postFollowUp(id, followUp)
                     val current = _state.value.room ?: break
                     var list = current.events
                     var active = current.activeTurns
@@ -677,6 +705,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
         // The local echo carries the event_id sent to the server, and the server's message.user
         // event comes back with that same id, so mergeEvent replaces the echo instead of adding a
         // second copy (the duplicate "you" lines in #2's follow-up).
+        chainHalted -= room.id
         val eventId = ident()
         val echo = RoomEvent(
             seq = Int.MAX_VALUE,
@@ -711,7 +740,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun createRoom(name: String, profiles: List<String>) {
+    fun createRoom(name: String, profiles: List<String>, rounds: Int = DEFAULT_BOT_ROUNDS) {
         val title = name.trim()
         if (title.isEmpty()) {
             note("Name the room.")
@@ -733,10 +762,47 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
                         JSONObject().put("member_id", "m$profile").put("profile", profile).put("handle", profile).put("display_name", profile),
                     )
                 }
-                rpc("groups.create", JSONObject().put("room_id", ident()).put("name", title.take(200)).put("members", members))
+                val roomId = ident()
+                rpc("groups.create", JSONObject().put("room_id", roomId).put("name", title.take(200)).put("members", members))
+                saveRounds(roomId, rounds)
                 refreshRooms()
             } catch (error: Exception) {
                 note(error.jr())
+            }
+        }
+    }
+
+    /** Room setting: max bot rounds per message (this phone only; see BotChain). */
+    fun setMaxRounds(rounds: Int) {
+        val room = _state.value.room ?: return
+        val value = rounds.coerceIn(1, 10)
+        _state.value = _state.value.copy(room = room.copy(maxRounds = value))
+        viewModelScope.launch(safe) { saveRounds(room.id, value) }
+    }
+
+    private suspend fun saveRounds(roomId: String, rounds: Int) {
+        roomRounds[roomId] = rounds.coerceIn(1, 10)
+        val json = JSONObject()
+        roomRounds.forEach { (key, value) -> json.put(key, value) }
+        store.saveRoomRounds(json.toString())
+    }
+
+    /** Post the app's bot-to-bot follow-up as a user event (the only kind a client may append). */
+    private fun postFollowUp(roomId: String, text: String) {
+        viewModelScope.launch(safe) {
+            try {
+                rpc(
+                    "groups.send",
+                    JSONObject().put("room_id", roomId).put("event_id", ident()).put(
+                        "payload",
+                        JSONObject().put("text", text).put("thread_id", "main"),
+                    ),
+                )
+                JrLog.i("bot chain follow-up posted")
+            } catch (error: kotlinx.coroutines.CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                note("Bot follow-up not sent: ${error.jr()}")
             }
         }
     }
@@ -755,6 +821,7 @@ class HermesModel(app: Application) : AndroidViewModel(app) {
 
     fun stopRoom() {
         val room = _state.value.room ?: return
+        chainHalted += room.id
         viewModelScope.launch(safe) {
             try {
                 rpc("groups.stop", JSONObject().put("room_id", room.id).put("cancel_id", ident()))
@@ -1742,7 +1809,9 @@ private fun eventLine(event: JSONObject, members: List<Member>): RoomEvent? {
     return when (kind) {
         "message.user" -> {
             val text = payload.optString("text")
-            if (text.isBlank()) null else RoomEvent(seq, "you", text.take(8_000), key = "e-$eventId", role = "user", eventId = eventId, at = at)
+            if (text.startsWith(FOLLOW_UP_MARK)) {
+                notice("Auto follow-up · " + text.removePrefix(FOLLOW_UP_MARK).substringBefore(":").take(160))
+            } else if (text.isBlank()) null else RoomEvent(seq, "you", text.take(8_000), key = "e-$eventId", role = "user", eventId = eventId, at = at)
         }
         "message.member" -> {
             val text = payload.optString("text")
@@ -1813,3 +1882,99 @@ private fun sniff(bytes: ByteArray, mime: String, name: String): String {
 }
 
 private fun ext(name: String): String = name.substringAfterLast('.', "png").lowercase().take(8)
+
+/**
+ * Bot-to-bot follow-ups for server-hosted rooms (the app side of "Max bot rounds").
+ *
+ * hermes serve runs one bounded Discussion per user message (gateway/hosted_room_discussion.py
+ * plan_next_task: MAX_DISCUSSION_ROUNDS = 3, MAX_DISCUSSION_MESSAGES = 10, both hard-coded). After
+ * round 0 it only re-runs a peer that a Bot @mentioned and that has not posted since the mention
+ * (_unaddressed_member_mentions). A peer that already spoke later in the same round — the usual
+ * case when an empty @ addresses everyone — is treated as answered, so "@default mentions @aixin"
+ * often ends the Discussion without aixin ever replying to default.
+ *
+ * When a Discussion settles (room.activity settled/bounded) with a Bot→Bot mention the target
+ * never answered (no later message from the target that mentions the speaker back), this posts a
+ * clearly marked follow-up user event addressed only to the target(s). Each follow-up is one more
+ * round; the chain stops at maxRounds (the user's own message is round 1), at the desktop's
+ * 10-bot-message budget, when Stop was pressed, or when the user sends something new.
+ * Only Discussions that settle while the room is open count: history never re-triggers.
+ */
+internal class BotChain {
+    var liveFrom = -1
+    private data class UserEvent(val seq: Int, val id: String, val followUp: Boolean)
+    private data class Reply(val seq: Int, val memberId: String, val text: String)
+    private val users = mutableListOf<UserEvent>()
+    private val replies = mutableMapOf<String, MutableList<Reply>>()
+    private val handled = mutableSetOf<String>()
+    private val mention = Regex("@([A-Za-z0-9][A-Za-z0-9._:-]*)")
+
+    fun observe(events: List<JSONObject>, members: List<Member>, maxRounds: Int, halted: Boolean): String? {
+        var result: String? = null
+        events.sortedBy { it.optInt("seq") }.forEach { event ->
+            val seq = event.optInt("seq")
+            val payload = event.optJSONObject("payload") ?: JSONObject()
+            when (event.optString("kind")) {
+                "message.user" -> users += UserEvent(seq, event.optString("event_id"), payload.optString("text").startsWith(FOLLOW_UP_MARK))
+                "message.member" -> {
+                    val discussion = payload.optString("discussion_event_id")
+                    if (discussion.isNotBlank()) {
+                        replies.getOrPut(discussion) { mutableListOf() } +=
+                            Reply(seq, payload.optString("member_id").ifBlank { event.optJSONObject("actor")?.optString("id").orEmpty() }, payload.optString("text"))
+                    }
+                }
+                "room.activity" -> {
+                    val discussion = payload.optString("discussion_event_id")
+                    val status = payload.optString("status")
+                    if (seq > liveFrom && !halted && discussion.isNotBlank() && discussion !in handled &&
+                        (status == "settled" || status == "bounded")
+                    ) {
+                        handled += discussion
+                        result = decide(discussion, members, maxRounds) ?: result
+                    }
+                }
+            }
+        }
+        return result
+    }
+
+    private fun decide(discussion: String, members: List<Member>, maxRounds: Int): String? {
+        val index = users.indexOfLast { it.id == discussion }
+        if (index < 0 || index != users.lastIndex) return null // a newer user message superseded it
+        // Rounds used = the user's own message + the follow-ups chained after it.
+        var start = index
+        while (start > 0 && users[start].followUp) start--
+        val round = index - start + 1
+        if (round >= maxRounds) return null
+        val chainIds = users.subList(start, index + 1).map { it.id }.toSet()
+        val spent = chainIds.sumOf { replies[it]?.size ?: 0 }
+        if (spent >= MAX_BOT_MESSAGES_PER_SEND) return null
+        val messages = replies[discussion].orEmpty().sortedBy { it.seq }
+        val byHandle = members.associateBy { it.handle.lowercase() }
+        val owed = linkedMapOf<String, MutableSet<String>>() // target member id -> speaker names
+        messages.forEachIndexed { at, message ->
+            val speaker = members.find { it.id == message.memberId } ?: return@forEachIndexed
+            mentioned(message.text, byHandle).filter { it.id != speaker.id }.forEach { target ->
+                val answered = messages.drop(at + 1).any { later ->
+                    later.memberId == target.id && mentioned(later.text, byHandle).any { it.id == speaker.id }
+                }
+                if (!answered) owed.getOrPut(target.id) { linkedSetOf() } += memberName(speaker)
+            }
+        }
+        if (owed.isEmpty()) return null
+        val parts = owed.mapNotNull { (targetId, speakers) ->
+            val target = members.find { it.id == targetId } ?: return@mapNotNull null
+            // Speakers are named WITHOUT "@": the server addresses every @handle in a user event.
+            "@${target.handle} — ${speakers.joinToString(" and ")} addressed you above"
+        }
+        if (parts.isEmpty()) return null
+        return FOLLOW_UP_MARK + "[bot round ${round + 1}/$maxRounds] " + parts.joinToString("; ") +
+            ": reply to them directly if you have something to add, otherwise reply (pass)."
+    }
+
+    private fun mentioned(text: String, byHandle: Map<String, Member>): List<Member> =
+        mention.findAll(text).mapNotNull { match ->
+            val raw = match.groupValues[1].lowercase()
+            byHandle[raw] ?: byHandle[raw.trimEnd('.', ':', '-', '_')]
+        }.distinct().toList()
+}
