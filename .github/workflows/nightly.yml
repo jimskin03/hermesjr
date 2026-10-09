@@ -120,7 +120,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          ids=$(gh api "repos/${{ github.repository }}/releases/tags/nightly" --jq '.assets[].id' 2>/dev/null || true)
+          # First run: no release yet (gh prints the 404 body to stdout, so check the exit code).
+          if ! release=$(gh api "repos/${{ github.repository }}/releases/tags/nightly" 2>/dev/null); then
+            echo "No nightly release yet; nothing to clear."
+            exit 0
+          fi
+          ids=$(printf '%s' "$release" | jq -r '.assets[].id')
           for id in ${ids}; do
             echo "Deleting release asset id=${id}"
             gh api -X DELETE "repos/${{ github.repository }}/releases/assets/${id}"
