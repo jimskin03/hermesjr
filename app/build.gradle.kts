@@ -15,6 +15,19 @@ android {
         versionName = "0.1.0"
     }
 
+    // CI only: the nightly workflow points HERMESJR_DEBUG_KEYSTORE at the debug keystore that
+    // signed the earlier test APKs, so the nightly installs over them. Local builds keep AGP's
+    // default ~/.android/debug.keystore.
+    val ciDebugKeystore = providers.environmentVariable("HERMESJR_DEBUG_KEYSTORE").orNull
+    if (!ciDebugKeystore.isNullOrBlank()) {
+        signingConfigs.getByName("debug") {
+            storeFile = file(ciDebugKeystore)
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
